@@ -167,11 +167,27 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
       }
     }
 
-    if (serveDashboard(req, res, { config, stats })) return;
+    if (serveDashboard(req, res, { config, stats, quotaStore, quotaRules })) return;
 
     const localUrl = new URL(req.url, 'http://localhost');
     if (isBrowserNoise(localUrl.pathname)) {
       jsonError(res, 404, 'not_found', 'Not found', config);
+      return;
+    }
+
+    // A bare GET /v1 (browser address bar or SDK base-URL probe) is answered
+    // locally instead of forwarding the upstream's 404 HTML page.
+    if ((req.method === 'GET' || req.method === 'HEAD') && (localUrl.pathname === '/v1' || localUrl.pathname === '/v1/')) {
+      const body = JSON.stringify({
+        service: 'openai-proxy-server',
+        endpoints: { api: '/v1/chat/completions', dashboard: `${config.dashboardPath}/` }
+      });
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+        ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {})
+      });
+      res.end(body);
       return;
     }
 
@@ -224,6 +240,10 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
           const amount = rule.metric === 'requests' ? 1 : (log.usage?.totalTokens || 0);
           quotaStore.record(rule, rule.ruleId, scopeValue(rule, clientIp), amount);
         }
+        // Show the remaining AFTER this request consumed usage, so the first
+        // request is e.g. 98% (not 100%) once its tokens were counted.
+        const after = strictest(quotaSnapshots(quotaStore, matchedQuotaRules, clientIp));
+        if (after) log.quota = after;
       }
       logLine(config, log);
     };

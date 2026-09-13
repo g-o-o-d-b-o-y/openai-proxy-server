@@ -1,3 +1,5 @@
+import { quotaSnapshots } from './quota.js';
+
 export const faviconSvg = String.raw`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#15213d"/><stop offset="1" stop-color="#0b1020"/></linearGradient></defs>
 <rect width="64" height="64" rx="14" fill="url(#bg)" stroke="#25314b" stroke-width="2"/>
@@ -51,9 +53,20 @@ input#search:focus,.ctl:focus{border-color:#3b82f6;box-shadow:0 0 0 3px #3b82f62
 .gbar i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22d3ee);border-radius:99px}
 .gtok{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
 .gcost{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.quotabanner{display:flex;flex-direction:column;gap:8px;margin:0 16px 10px;border:1px solid var(--line);border-radius:12px;background:#0d1424;padding:10px 12px}
+.qb-head{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.qb-list{display:flex;flex-direction:column;gap:8px}
+.qrow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.qname{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;min-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qbig{flex:1;min-width:180px;height:18px;background:#1b2740;border-radius:99px;position:relative;overflow:hidden}
+.qbig i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#22d3ee);border-radius:99px}
+.qbig i.warn{background:linear-gradient(90deg,#f59e0b,#facc15)}
+.qbig i.low{background:linear-gradient(90deg,#ef4444,#f97316)}
+.qbig b{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#eaf2ff;text-shadow:0 1px 2px #000a}
+.qmeta{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
 .tablewrap{overflow:auto;max-height:58vh;-webkit-overflow-scrolling:touch;border-top:1px solid var(--line)}
 .tablewrap.empty-state{display:flex;align-items:center;justify-content:center;min-height:340px;max-height:none}
-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:960px}
+table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:1000px}
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #202c44;white-space:nowrap;font-variant-numeric:tabular-nums}
 th{color:var(--muted);font-weight:600;position:sticky;top:0;background:#0f1728;z-index:1;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
 tbody tr{transition:background .12s}
@@ -61,12 +74,14 @@ tbody tr:hover{background:#131d33}
 td.c-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:320px;overflow:hidden;text-overflow:ellipsis}
 td.c-model{max-width:220px;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 td.c-ip{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.c-quota{min-width:86px;text-align:center}
-.qbar{display:inline-flex;align-items:center;gap:0;min-width:64px;max-width:120px;height:16px;background:#1b2740;border-radius:99px;overflow:hidden;position:relative;padding:0 6px;font-variant-numeric:tabular-nums}
+.c-quota{min-width:108px}
+.qcell{display:inline-flex;flex-direction:column;align-items:stretch;gap:3px;min-width:100px;max-width:150px;font-variant-numeric:tabular-nums}
+.qbar{display:flex;align-items:center;height:16px;background:#1b2740;border-radius:99px;overflow:hidden;position:relative;padding:0 6px}
 .qbar i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22d3ee);border-radius:99px;position:absolute;left:0;top:0}
 .qbar b{position:relative;z-index:1;font-size:10px;font-weight:700;color:#eaf2ff;white-space:nowrap;background:rgba(11,16,32,.55);border-radius:99px;padding:0 5px}
 .qbar.low i{background:linear-gradient(90deg,#ef4444,#f97316)}
 .qbar.mid i{background:linear-gradient(90deg,#f59e0b,#facc15)}
+.qleft{color:var(--muted);font-size:10px;text-align:center;white-space:nowrap}
 .badge{display:inline-block;border-radius:999px;padding:2px 9px;font-size:10.5px;font-weight:700;letter-spacing:.05em}
 .badge.llm{background:#19305a;color:#8fc3ff}
 .badge.tts{background:#312055;color:#c9b0ff}
@@ -92,7 +107,7 @@ select#pageSize{background:#0d1424;border:1px solid var(--line2);color:var(--tex
 footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:18px 28px;color:#5f6d85;font-size:12px;max-width:1200px;margin:0 auto;width:100%}
 .live{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;box-shadow:0 0 0 5px #4ade8020}
 @media(max-width:820px){main{padding:20px 16px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:20px}.listbar{flex-direction:column;align-items:stretch}.ltools{justify-content:flex-start;width:100%}}
-@media(max-width:620px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.card{padding:12px;border-radius:12px}.metric b{font-size:18px}.metric span{font-size:11px}.listbar{gap:10px;padding:14px 12px 10px}.ltools{flex-wrap:wrap;width:100%}.ltools #search{flex:1 1 100%;font-size:16px}.ltools .ctl{flex:1 1 100%;font-size:16px}.ltools .pbtn{flex:0 0 auto}.chips{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:0 12px 10px}.chips::-webkit-scrollbar{display:none}.chip.fchip .fval{max-width:150px}th,td{padding:8px 6px;font-size:12px}.tablewrap{max-height:52vh}.pager{padding:10px 12px 12px}.pbtn{flex:1;min-height:40px;padding:8px 10px}.pinfo{flex-basis:100%;text-align:center}.grow{min-height:38px}.glist{grid-template-columns:1fr}thead th.c-model,td.c-model,thead th.c-out,td.c-out{display:none}header{align-items:flex-start;flex-direction:column;gap:10px}.title{font-size:20px}.pill{align-self:flex-end}.tablewrap.empty-state{min-height:240px}.empty svg{width:52px;height:52px}.groups{margin:0 12px 8px}}
+@media(max-width:620px){.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.card{padding:12px;border-radius:12px}.metric b{font-size:18px}.metric span{font-size:11px}.listbar{gap:10px;padding:14px 12px 10px}.ltools{flex-wrap:wrap;width:100%}.ltools #search{flex:1 1 100%;font-size:16px}.ltools .ctl{flex:1 1 100%;font-size:16px}.ltools .pbtn{flex:0 0 auto}.chips{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:0 12px 10px}.chips::-webkit-scrollbar{display:none}.chip.fchip .fval{max-width:150px}th,td{padding:8px 6px;font-size:12px}.tablewrap{max-height:52vh}.pager{padding:10px 12px 12px}.pbtn{flex:1;min-height:40px;padding:8px 10px}.pinfo{flex-basis:100%;text-align:center}.grow{min-height:38px}.glist{grid-template-columns:1fr}thead th.c-model,td.c-model,thead th.c-out,td.c-out{display:none}header{align-items:flex-start;flex-direction:column;gap:10px}.title{font-size:20px}.pill{align-self:flex-end}.tablewrap.empty-state{min-height:240px}.empty svg{width:52px;height:52px}.qrow{flex-direction:column;align-items:stretch;gap:6px}.qname,.qbig{min-width:0}.groups{margin:0 12px 8px}}
 @media(max-width:380px){main{padding:14px 10px}.card{padding:10px;border-radius:10px}.metric b{font-size:16px}.title{font-size:18px}.grid{gap:6px}.sub{font-size:12px}}
 `;
 
@@ -125,6 +140,10 @@ const body = `
 </div>
 </div>
 <div class="chips" id="chips"></div>
+<div class="quotabanner" id="quotaBanner" hidden>
+<div class="qb-head"><span title="Limits that apply to the IP viewing this dashboard">Your quota</span><button class="pbtn tiny" id="quotaClose" title="Hide quota panel">✕</button></div>
+<div class="qb-list" id="quotaList"></div>
+</div>
 <div class="groups" id="groups" hidden>
 <div class="ghead"><span id="groupsTitle">Groups</span><button class="pbtn tiny" id="groupsClose" title="Close grouping">✕</button></div>
 <div class="glist" id="groupsList"></div>
@@ -135,7 +154,7 @@ const body = `
 <b id="emptyTitle">No requests yet</b>
 <span id="emptySub">Requests proxied through this server will show up here in real time.</span>
 </div>
-<table id="logTable" hidden><thead><tr><th>Time</th><th>IP</th><th>Type</th><th>Method</th><th>Path</th><th class="c-model">Model</th><th>Status</th><th>Latency</th><th>Tokens</th><th class="c-quota">Quota</th><th class="c-out">Out</th></tr></thead><tbody id="rows"></tbody></table>
+<table id="logTable" hidden><thead><tr><th>Time</th><th>IP</th><th>Type</th><th>Method</th><th>Path</th><th class="c-model">Model</th><th>Status</th><th>Latency</th><th>Tokens</th><th class="c-quota" title="Remaining usage for matching limits">Quota</th><th class="c-out">Out</th></tr></thead><tbody id="rows"></tbody></table>
 </div>
 <div class="pager" id="pager"><button class="pbtn" id="prevBtn">‹ Prev</button><span class="pinfo" id="pageInfo">Page 1 of 1</span><button class="pbtn" id="nextBtn">Next ›</button><select id="pageSize" aria-label="Rows per page"><option>20</option><option selected>50</option><option>100</option></select><button class="pbtn accent hidden" id="latestBtn">Go to latest</button></div>
 </section>
@@ -153,10 +172,14 @@ const kindInfo = (k) => { k = (k || 'openai').toLowerCase(); return k === 'stt' 
 const statusCls = (s) => !s ? 'bad' : s < 400 ? 'ok' : s < 500 ? 'warn' : 'bad';
 const quotaCell = (q) => {
   if (!q) return '<span class="muted">—</span>';
-  const cls = q.pct <= 15 ? ' low' : q.pct <= 40 ? ' mid' : '';
-  const where = q.scope === 'ip' ? ' (IP ' + q.key + ')' : '';
-  const title = 'Remaining ' + q.remaining + ' of ' + q.max + ' ' + q.metric + ' in ' + (q.windowLabel || '') + where;
-  return '<span class="qbar' + cls + '" title="' + esc(title) + '"><i style="width:' + q.pct + '%"></i><b>' + q.pct + '%</b></span>';
+  const cls = q.pct <= 15 ? ' low' : q.pct <= 50 ? ' mid' : '';
+  const where = q.scope === 'ip' ? ' for IP ' + q.key : ' for all requests';
+  const title = 'Remaining ' + q.remaining + ' of ' + q.max + ' ' + q.metric + ' in ' + (q.windowLabel || '') + where + (q.model ? ' · ' + q.model : '');
+  const short = q.metric === 'tokens' ? 'tok' : 'req';
+  return '<span class="qcell" title="' + esc(title) + '">' +
+    '<span class="qbar' + cls + '"><i style="width:' + q.pct + '%"></i><b>' + q.pct + '%</b></span>' +
+    '<span class="qleft">' + fmt(q.remaining) + ' / ' + fmt(q.max) + ' ' + short + '</span>' +
+    '</span>';
 };
 
 const token = new URLSearchParams(location.search).get('token');
@@ -303,8 +326,34 @@ async function loadGroups() {
   } catch {}
 }
 
+async function loadQuota() {
+  try {
+    const res = await fetch(base + '/api/quota' + (token ? '?token=' + encodeURIComponent(token) : ''));
+    const data = await res.json();
+    renderQuota(Array.isArray(data) ? null : data);
+  } catch {}
+}
+
+function renderQuota(data) {
+  const box = $('quotaBanner');
+  if (!data || !data.quotas || !data.quotas.length) { box.hidden = true; return; }
+  box.hidden = false;
+  $('quotaList').innerHTML = data.quotas.map((q) => {
+    const label = q.name || q.model || q.metric;
+    const cls = q.pct <= 15 ? ' low' : q.pct <= 50 ? ' warn' : '';
+    const unit = q.metric === 'tokens' ? 'tokens' : 'requests';
+    const scope = q.scope === 'ip' ? 'for your IP ' + q.key : 'shared by all requests';
+    const title = (q.name ? q.name + ' · ' : '') + (q.model || q.metric) + ' · ' + q.used + '/' + q.max + ' ' + unit + ' · shown for the client IP viewing this dashboard';
+    return '<div class="qrow" title="' + esc(title) + '">' +
+      '<span class="qname">' + esc(label) + '</span>' +
+      '<span class="qbig"><i class="' + cls + '" style="width:' + q.pct + '%"></i><b>' + q.pct + '% left</b></span>' +
+      '<span class="qmeta">' + fmt(q.remaining) + ' / ' + fmt(q.max) + ' ' + unit + ' · ' + (q.windowLabel || '') + ' · ' + esc(scope) + '</span>' +
+      '</div>';
+  }).join('');
+}
+
 let refreshTimer = null;
-function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { loadLogs(); loadGroups(); }, 400); }
+function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { loadLogs(); loadGroups(); loadQuota(); }, 400); }
 
 function render(s) {
   $('requests').textContent = fmt(s.totals.requests);
@@ -368,6 +417,7 @@ $('groupsList').addEventListener('click', (e) => {
 });
 $('groupBy').addEventListener('change', (e) => { state.groupBy = e.target.value; state.page = 1; loadLogs(); loadGroups(); });
 $('groupsClose').addEventListener('click', () => { state.groupBy = 'none'; $('groupBy').value = 'none'; $('groups').hidden = true; });
+$('quotaClose').addEventListener('click', () => { $('quotaBanner').hidden = true; });
 $('pageSize').addEventListener('change', (e) => { state.pageSize = Number(e.target.value); state.page = 1; loadLogs(); });
 $('prevBtn').addEventListener('click', () => { if (state.page > 1) { state.page--; loadLogs(); } });
 $('nextBtn').addEventListener('click', () => { if (state.page < Math.ceil(state.total / state.pageSize)) { state.page++; loadLogs(); } });
@@ -379,6 +429,7 @@ es.onerror = () => { $('conn').textContent = 'reconnecting'; };
 es.onmessage = (e) => { try { const d = JSON.parse(e.data); if (d.snapshot) render(d.snapshot); } catch {} };
 
 loadLogs();
+loadQuota();
 `;
 
 const page = `<!doctype html>
@@ -431,7 +482,7 @@ function readLogFilterParams(url) {
   };
 }
 
-export function serveDashboard(req, res, { config, stats }) {
+export function serveDashboard(req, res, { config, stats, quotaStore, quotaRules }) {
   const url = new URL(req.url, 'http://localhost');
   const base = config.dashboardPath;
   if (!url.pathname.startsWith(base)) return false;
@@ -520,6 +571,19 @@ export function serveDashboard(req, res, { config, stats }) {
 
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify({ field, total: filtered.length, groups }));
+    return true;
+  }
+
+  if (url.pathname === base + '/api/quota') {
+    if (!quotaRules || !quotaRules.length) {
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ clientIp: String(req.socket.remoteAddress || '').replace(/^::ffff:/, ''), quotas: [] }));
+      return true;
+    }
+    const clientIp = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    const quotas = quotaSnapshots(quotaStore, quotaRules, clientIp);
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ clientIp, quotas }));
     return true;
   }
 

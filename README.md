@@ -265,6 +265,7 @@ API endpoints:
 GET /_proxy/api/stats
 GET /_proxy/api/logs?limit=&offset=&kind=&ip=&model=&method=&status=&path=&hour=&q=
 GET /_proxy/api/groups?field=ip|model|method|status|kind|path|hour&limit=&kind=&ip=&model=&method=&status=&path=&hour=&q=
+GET /_proxy/api/quota   # current limits + remaining usage for the requesting IP
 GET /_proxy/events      # Server-Sent Events
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "openai-proxy-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A tiny OpenAI-compatible reverse proxy for LLM, TTS and STT with streaming, usage stats and a live dashboard.",
   "type": "module",
   "author": "Good Boy",

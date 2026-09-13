@@ -234,6 +234,13 @@ test('enforces per-IP token quota and reports remaining headers', async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.ok(stats.logs.some((l) => l.status === 429 && l.quota && l.quota.name === 'llm-week'), '429 logged with quota');
   assert.ok(stats.logs.filter((l) => l.status === 200).every((l) => l.quota && Number.isInteger(l.quota.pct)), '200 rows carry quota pct');
+
+  // /api/quota exposes the current limit state for the requesting IP.
+  const quotaApi = await (await fetch(`http://127.0.0.1:${proxyPort}/_proxy/api/quota`)).json();
+  assert.equal(quotaApi.clientIp, '127.0.0.1');
+  assert.equal(quotaApi.quotas.length, 1);
+  assert.equal(quotaApi.quotas[0].name, 'llm-week');
+  assert.equal(quotaApi.quotas[0].remaining, 0);
 });
 
 test('quota rules without model matcher apply to multipart uploads by kind', async (t) => {
@@ -332,6 +339,13 @@ test('serves favicon locally without recording stats/logs or hitting upstream', 
     const res = await fetch(`http://127.0.0.1:${proxyPort}${noisePath}`);
     assert.equal(res.status, 404, `${noisePath} must not be proxied`);
   }
+
+  // Bare GET /v1 is answered locally with a small JSON hint (no upstream, no logs).
+  const v1 = await fetch(`http://127.0.0.1:${proxyPort}/v1`);
+  assert.equal(v1.status, 200);
+  assert.match(await v1.text(), /openai-proxy-server/);
+  const v1head = await fetch(`http://127.0.0.1:${proxyPort}/v1/`, { method: 'HEAD' });
+  assert.equal(v1head.status, 200);
   await new Promise(resolve => setTimeout(resolve, 20));
 
   assert.equal(stats.totals.requests, 0);

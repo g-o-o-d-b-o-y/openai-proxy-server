@@ -18,6 +18,14 @@ if (args.includes('--version') || args.includes('-v')) {
 loadDotEnv();
 
 startServer().catch((error) => {
+  if (error?.code === 'EADDRINUSE') {
+    const port = error.port || process.env.PORT || 56787;
+    console.error(`[openai-proxy-server] Fatal: address already in use (${error.address || '0.0.0.0'}:${port}).`);
+    console.error(`[openai-proxy-server] Another instance is already listening. Stop it with:  lsof -tiTCP:${port} | xargs kill`);
+    console.error(`[openai-proxy-server] Or run a different port:  PORT=56788 npm start`);
+    process.exitCode = 1;
+    return;
+  }
   console.error('[openai-proxy-server] fatal:', error?.stack || error);
   process.exitCode = 1;
 });
