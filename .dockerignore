@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.openai-proxy-server
+node_modules
+scr.png
+test
+*.log
+.DS_Store
+Dockerfile

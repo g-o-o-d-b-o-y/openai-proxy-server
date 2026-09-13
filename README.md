@@ -71,6 +71,29 @@ npm install
 npm start
 ```
 
+## Docker
+
+A small Alpine image is published to GitHub Container Registry for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
+docker run -d -p 56787:56787 \
+  -e OPENAI_API_KEY=sk-or-v1-... \
+  -e OPENAI_BASE_URL=https://openrouter.ai/api/v1 \
+  -e OPENAI_MODEL=google/gemma-4-26b-a4b-it \
+  ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
+```
+
+Open `http://localhost:56787/` for the live dashboard. Pass `TTS_API_KEY`, `STT_API_KEY`, `LIMITS`, etc. the same way, or mount a `.env` file instead:
+
+```bash
+docker run -d -p 56787:56787 -v "$PWD/.env:/app/.env" \
+  -v oproxy-stats:/app/.openai-proxy-server \
+  ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
+```
+
+The image runs as the non-root `node` user, exposes port `56787`, and includes a `HEALTHCHECK` that pings the dashboard. Secrets are never baked into the image.
+
 ## LLM example
 
 ```bash
