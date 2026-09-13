@@ -6,6 +6,7 @@ import { classifyRoute, buildUpstreamUrl, patchJsonBody, routeConfig } from './r
 import { serveDashboard, serveFavicon } from './dashboard.js';
 import { StatsStore } from './stats.js';
 import { paint, statusStyle, routeLabel, formatDuration, humanBytes, formatCount, ellipsize, PREFIX } from './term.js';
+import { QuotaStore, withRuleIds, matchRules, quotaSnapshots, strictest, denyReason, scopeValue } from './quota.js';
 
 const HOP_BY_HOP = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
 
@@ -39,6 +40,31 @@ function jsonError(res, status, code, message, config) {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {})
+  });
+  res.end(body);
+}
+
+function quotaHeaders(snapshot) {
+  if (!snapshot) return {};
+  return {
+    'x-quota-used': String(snapshot.used),
+    'x-quota-max': String(snapshot.max),
+    'x-quota-remaining': String(snapshot.remaining),
+    'x-quota-remaining-pct': String(snapshot.pct),
+    'x-quota-window': snapshot.windowLabel,
+    'x-quota-metric': snapshot.metric,
+    'x-quota-key': snapshot.scope === 'ip' ? snapshot.key : 'all'
+  };
+}
+
+function quotaError(res, config, reason, snapshot) {
+  const body = JSON.stringify({ error: { message: reason, type: 'quota_exceeded', code: 'quota_exceeded', quota: snapshot } });
+  res.writeHead(429, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {}),
+    ...quotaHeaders(snapshot)
   });
   res.end(body);
 }
@@ -125,6 +151,9 @@ function logLine(config, log) {
 }
 
 export function createProxyServer(config, stats = new StatsStore({ file: config.statsFile, maxLogs: config.maxLogEntries })) {
+  const quotaStore = new QuotaStore();
+  const quotaRules = Array.isArray(config.limits) ? withRuleIds(config.limits) : [];
+
   const server = http.createServer(async (req, res) => {
     if (serveFavicon(req, res, { config })) return;
 
@@ -182,11 +211,20 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
     let bodyBuffer = null;
     let upstreamReq;
     let finished = false;
+    let matchedQuotaRules = [];
+    let quotaDenied = false;
+    let quotaStrict = null;
 
     const finishOnce = (result) => {
       if (finished) return;
       finished = true;
-      const log = stats.finish(requestMeta, { bytesIn, ...result });
+      const log = stats.finish(requestMeta, { bytesIn, ...result, quota: result.quota || quotaStrict });
+      if (matchedQuotaRules.length && !quotaDenied) {
+        for (const rule of matchedQuotaRules) {
+          const amount = rule.metric === 'requests' ? 1 : (log.usage?.totalTokens || 0);
+          quotaStore.record(rule, rule.ruleId, scopeValue(rule, clientIp), amount);
+        }
+      }
       logLine(config, log);
     };
 
@@ -205,6 +243,25 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
           bodyBuffer = Buffer.from(JSON.stringify(value));
         } else {
           bodyBuffer = Buffer.alloc(0);
+        }
+      }
+
+      // Quota pre-check (soft): reject before spending tokens upstream once the
+      // window allowance is exhausted. Model-based rules need a known model
+      // (JSON bodies); rules without a model matcher also apply to multipart
+      // uploads (matched by route kind).
+      if (quotaRules.length && (parsedModel !== null || quotaRules.some((rule) => !rule.model))) {
+        matchedQuotaRules = matchRules(quotaRules, { model: parsedModel, kind });
+        if (matchedQuotaRules.length) {
+          const snapshots = quotaSnapshots(quotaStore, matchedQuotaRules, clientIp);
+          quotaStrict = strictest(snapshots);
+          const denied = denyReason(snapshots);
+          if (denied) {
+            quotaDenied = true;
+            quotaError(res, config, denied, quotaStrict);
+            finishOnce({ status: 429, bytesOut: 0, error: denied, model: parsedModel || upstream.model, quota: quotaStrict });
+            return;
+          }
         }
       }
 
@@ -237,7 +294,7 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
           }
         };
 
-        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.statusMessage || undefined, copyResponseHeaders(upstreamRes.headers, config.corsOrigin));
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.statusMessage || undefined, { ...copyResponseHeaders(upstreamRes.headers, config.corsOrigin), ...quotaHeaders(quotaStrict) });
 
         const tap = new Transform({
           transform(chunk, _enc, cb) {

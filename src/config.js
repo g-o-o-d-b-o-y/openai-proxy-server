@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { parseLimits } from './quota.js';
 
 const asBool = (value, fallback = false) => {
   if (value == null || value === '') return fallback;
@@ -47,6 +48,7 @@ export function loadConfig(env = process.env) {
     maxStreamBodyBytes: asInt(env.MAX_STREAM_BODY_MB, 512) * 1024 * 1024,
     upstreamTimeoutMs: asInt(env.UPSTREAM_TIMEOUT_MS, 0),
     maxLogEntries: asInt(env.MAX_LOG_ENTRIES, 1000),
+    limits: parseLimits(env.LIMITS),
     statsFile: path.resolve(process.cwd(), env.STATS_FILE || '.openai-proxy-server/stats.json'),
     logLevel: env.LOG_LEVEL || 'info',
     corsOrigin: env.CORS_ORIGIN ?? '*',

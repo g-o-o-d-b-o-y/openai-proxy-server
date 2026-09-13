@@ -181,6 +181,108 @@ test('streams non-JSON request bodies without buffering or rewriting', async (t)
   assert.equal(received, body);
 });
 
+test('enforces per-IP token quota and reports remaining headers', async (t) => {
+  let chatHits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) {}
+    if (req.url === '/api/v1/chat/completions') {
+      chatHits++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 } }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const upstreamPort = await listen(upstream);
+  t.after(() => close(upstream));
+
+  const config = loadConfig({
+    HOST: '127.0.0.1', PORT: '0',
+    OPENAI_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, OPENAI_API_KEY: 'k', OPENAI_MODEL: 'server-llm',
+    TTS_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, TTS_API_KEY: 'k', TTS_MODEL: 'server-tts',
+    STT_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, STT_API_KEY: 'k',
+    LIMITS: JSON.stringify([{ metric: 'tokens', scope: 'ip', window: '7d', max: 15, model: 'server-llm', name: 'llm-week' }]),
+    LOG_LEVEL: 'silent', STATS_FILE: ''
+  });
+  const stats = new StatsStore({ file: null });
+  const proxy = createProxyServer(config, stats);
+  const proxyPort = await listen(proxy);
+  t.after(() => close(proxy));
+
+  const call = () => fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] })
+  });
+
+  const r1 = await call();
+  assert.equal(r1.status, 200);
+  assert.equal(r1.headers.get('x-quota-remaining-pct'), '100');
+  assert.equal(r1.headers.get('x-quota-max'), '15');
+
+  const r2 = await call();
+  assert.equal(r2.status, 200);
+  assert.equal(r2.headers.get('x-quota-remaining-pct'), '33');
+  assert.equal(r2.headers.get('x-quota-remaining'), '5');
+
+  const r3 = await call();
+  assert.equal(r3.status, 429);
+  assert.equal(chatHits, 2, 'denied request must not reach upstream');
+  const body = await r3.json();
+  assert.equal(body.error.type, 'quota_exceeded');
+  assert.equal(r3.headers.get('x-quota-remaining-pct'), '0');
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(stats.logs.some((l) => l.status === 429 && l.quota && l.quota.name === 'llm-week'), '429 logged with quota');
+  assert.ok(stats.logs.filter((l) => l.status === 200).every((l) => l.quota && Number.isInteger(l.quota.pct)), '200 rows carry quota pct');
+});
+
+test('quota rules without model matcher apply to multipart uploads by kind', async (t) => {
+  let hitCount = 0;
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) {}
+    if (req.url === '/api/v1/audio/transcriptions') {
+      hitCount++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ text: 'hello' }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  const upstreamPort = await listen(upstream);
+  t.after(() => close(upstream));
+
+  const config = loadConfig({
+    HOST: '127.0.0.1', PORT: '0',
+    OPENAI_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, OPENAI_API_KEY: 'k', OPENAI_MODEL: 'server-llm',
+    TTS_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, TTS_API_KEY: 'k',
+    STT_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`, STT_API_KEY: 'k',
+    LIMITS: JSON.stringify([{ metric: 'requests', scope: 'ip', window: '1h', max: 1, kind: 'stt', name: 'stt-quota' }]),
+    LOG_LEVEL: 'silent', STATS_FILE: ''
+  });
+  const proxy = createProxyServer(config, new StatsStore({ file: null }));
+  const proxyPort = await listen(proxy);
+  t.after(() => close(proxy));
+
+  const body = '--x\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n--x--\r\n';
+  const file = '--x\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\nContent-Type: audio/wav\r\n\r\nxyz\r\n--x--\r\n';
+  const call = () => fetch(`http://127.0.0.1:${proxyPort}/v1/audio/transcriptions`, {
+    method: 'POST',
+    headers: { 'content-type': 'multipart/form-data; boundary=x' },
+    body: `${file}${body}`
+  });
+
+  const r1 = await call();
+  assert.equal(r1.status, 200);
+  assert.equal(r1.headers.get('x-quota-max'), '1');
+  assert.equal(r1.headers.get('x-quota-remaining-pct'), '100');
+
+  const r2 = await call();
+  assert.equal(r2.status, 429);
+  assert.equal(hitCount, 1, 'second request must not reach upstream');
+  const denied = await r2.json();
+  assert.equal(denied.error.type, 'quota_exceeded');
+});
+
 test('serves favicon locally without recording stats/logs or hitting upstream', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-proxy-favicon-'));
   // Unreachable upstream: proves the favicon never gets proxied.

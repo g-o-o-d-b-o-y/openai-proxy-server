@@ -111,6 +111,7 @@ export class StatsStore {
       bytesIn,
       bytesOut,
       usage,
+      quota: result.quota || null,
       error: result.error ? String(result.error) : null
     };
     this.logs.push(log);

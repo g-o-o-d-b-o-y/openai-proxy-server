@@ -209,6 +209,35 @@ Authorization: Bearer my-local-secret
 
 The upstream keys are never returned to the client.
 
+## Limits / quotas
+
+You can configure one or more usage quotas in `LIMITS` (JSON array). Each rule optionally matches a model and/or route kind, and counts a metric over a rolling window per IP address (or globally):
+
+```dotenv
+# max 2,000,000 tokens per IP for this model over a rolling 7 days
+LIMITS=[{"metric":"tokens","scope":"ip","window":"7d","max":2000000,"model":"google/gemma-4-26b-a4b-it"}]
+# max 100 requests per IP per hour
+LIMITS=[{"metric":"requests","scope":"ip","window":"1h","max":100}]
+```
+
+Fields per rule:
+
+- `metric` — `tokens` (counts `usage.total_tokens` from the upstream response) or `requests` (always 1).
+- `scope` — `ip` buckets usage per client IP; `all` is one shared bucket.
+- `window` — rolling period: `1h`, `24h`, `7d`, `30d`, or a millisecond number.
+- `max` — the allowance per window.
+- `model` — optional exact model matcher (case-insensitive); omit to match any model.
+- `kind` — optional exact matcher: `openai` (LLM), `tts`, `stt`.
+- `name` — optional label shown in the dashboard/API.
+
+Behavior:
+
+- Quotas are **soft**: a request is allowed while usage `< max`; once a completed request pushes usage to `max`, later matching requests are rejected with **HTTP 429 `quota_exceeded`** (with the quota details in the JSON body) **before** hitting the upstream, so no tokens are spent.
+- Every proxied response includes quota headers for the tightest matching rule: `X-Quota-Used`, `X-Quota-Max`, `X-Quota-Remaining`, `X-Quota-Remaining-Pct`, `X-Quota-Window`, `X-Quota-Metric` (429 responses include them too).
+- The dashboard's **Quota** column shows a remaining-percentage bar for each request; the same `quota` object is included in `/api/logs` entries.
+- Model matchers apply to JSON requests (the model is known after injection). Rules **without** a `model` matcher also apply to multipart/streamed uploads (matched by route `kind` or applied globally); token counting for those still needs a `usage` object in the response.
+- Quota accounting lives in memory (reset on restart), like `stats`; usage without a `usage` object in the response counts 0 tokens.
+
 ## Dashboard and stats
 
 Open:

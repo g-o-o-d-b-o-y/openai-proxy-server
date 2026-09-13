@@ -50,6 +50,9 @@ export async function startServer(overrides = {}) {
   } else if (config.host !== '127.0.0.1' && config.host !== 'localhost') {
     console.log(`${PREFIX} ${dim(pad('Listening:'))} ${config.host}:${port}`);
   }
+  if (config.limits && config.limits.length) {
+    console.log(`${PREFIX} Quotas: ${config.limits.length} rule(s) enabled`);
+  }
   if (config.host !== '127.0.0.1' && config.host !== 'localhost' && !config.proxyApiKey) {
     console.log(paint(`${PREFIX} WARNING: the proxy is reachable from other devices on your network (HOST=${config.host}) but PROXY_API_KEY is empty.`, 'yellow'));
     console.log(paint(`${PREFIX}   Anyone on the network can call your upstream API through this proxy.`, 'yellow'));

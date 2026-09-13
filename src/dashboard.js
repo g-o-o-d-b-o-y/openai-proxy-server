@@ -53,7 +53,7 @@ input#search:focus,.ctl:focus{border-color:#3b82f6;box-shadow:0 0 0 3px #3b82f62
 .gcost{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
 .tablewrap{overflow:auto;max-height:58vh;-webkit-overflow-scrolling:touch;border-top:1px solid var(--line)}
 .tablewrap.empty-state{display:flex;align-items:center;justify-content:center;min-height:340px;max-height:none}
-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:880px}
+table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:960px}
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #202c44;white-space:nowrap;font-variant-numeric:tabular-nums}
 th{color:var(--muted);font-weight:600;position:sticky;top:0;background:#0f1728;z-index:1;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
 tbody tr{transition:background .12s}
@@ -61,6 +61,12 @@ tbody tr:hover{background:#131d33}
 td.c-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:320px;overflow:hidden;text-overflow:ellipsis}
 td.c-model{max-width:220px;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 td.c-ip{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.c-quota{min-width:86px;text-align:center}
+.qbar{display:inline-flex;align-items:center;gap:0;min-width:64px;max-width:120px;height:16px;background:#1b2740;border-radius:99px;overflow:hidden;position:relative;padding:0 6px;font-variant-numeric:tabular-nums}
+.qbar i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#22d3ee);border-radius:99px;position:absolute;left:0;top:0}
+.qbar b{position:relative;z-index:1;font-size:10px;font-weight:700;color:#eaf2ff;white-space:nowrap;background:rgba(11,16,32,.55);border-radius:99px;padding:0 5px}
+.qbar.low i{background:linear-gradient(90deg,#ef4444,#f97316)}
+.qbar.mid i{background:linear-gradient(90deg,#f59e0b,#facc15)}
 .badge{display:inline-block;border-radius:999px;padding:2px 9px;font-size:10.5px;font-weight:700;letter-spacing:.05em}
 .badge.llm{background:#19305a;color:#8fc3ff}
 .badge.tts{background:#312055;color:#c9b0ff}
@@ -129,7 +135,7 @@ const body = `
 <b id="emptyTitle">No requests yet</b>
 <span id="emptySub">Requests proxied through this server will show up here in real time.</span>
 </div>
-<table id="logTable" hidden><thead><tr><th>Time</th><th>IP</th><th>Type</th><th>Method</th><th>Path</th><th class="c-model">Model</th><th>Status</th><th>Latency</th><th>Tokens</th><th class="c-out">Out</th></tr></thead><tbody id="rows"></tbody></table>
+<table id="logTable" hidden><thead><tr><th>Time</th><th>IP</th><th>Type</th><th>Method</th><th>Path</th><th class="c-model">Model</th><th>Status</th><th>Latency</th><th>Tokens</th><th class="c-quota">Quota</th><th class="c-out">Out</th></tr></thead><tbody id="rows"></tbody></table>
 </div>
 <div class="pager" id="pager"><button class="pbtn" id="prevBtn">‹ Prev</button><span class="pinfo" id="pageInfo">Page 1 of 1</span><button class="pbtn" id="nextBtn">Next ›</button><select id="pageSize" aria-label="Rows per page"><option>20</option><option selected>50</option><option>100</option></select><button class="pbtn accent hidden" id="latestBtn">Go to latest</button></div>
 </section>
@@ -145,6 +151,13 @@ const timeFmt = (iso) => { const d = new Date(iso); const same = d.toDateString(
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const kindInfo = (k) => { k = (k || 'openai').toLowerCase(); return k === 'stt' ? { label: 'STT', cls: 'stt' } : k === 'tts' ? { label: 'TTS', cls: 'tts' } : { label: 'LLM', cls: 'llm' }; };
 const statusCls = (s) => !s ? 'bad' : s < 400 ? 'ok' : s < 500 ? 'warn' : 'bad';
+const quotaCell = (q) => {
+  if (!q) return '<span class="muted">—</span>';
+  const cls = q.pct <= 15 ? ' low' : q.pct <= 40 ? ' mid' : '';
+  const where = q.scope === 'ip' ? ' (IP ' + q.key + ')' : '';
+  const title = 'Remaining ' + q.remaining + ' of ' + q.max + ' ' + q.metric + ' in ' + (q.windowLabel || '') + where;
+  return '<span class="qbar' + cls + '" title="' + esc(title) + '"><i style="width:' + q.pct + '%"></i><b>' + q.pct + '%</b></span>';
+};
 
 const token = new URLSearchParams(location.search).get('token');
 const base = location.pathname.replace(/\/$/, '');
@@ -227,6 +240,7 @@ function renderLogs(logs) {
       '<td><span class="st ' + statusCls(l.status) + '">' + (l.status || 'ERR') + '</span></td>' +
       '<td>' + dur(l.durationMs) + '</td>' +
       '<td>' + fmt(l.usage ? l.usage.totalTokens : 0) + '</td>' +
+      '<td class="c-quota">' + quotaCell(l.quota) + '</td>' +
       '<td class="c-out">' + bytes(l.bytesOut) + '</td>' +
       '</tr>';
   }).join('');
