@@ -1,0 +1,30 @@
+name: Publish Package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: npm publish --access public
+        # Authenticate with an npm token. Create an npm "Automation"
+        # (publish-only) access token and add it as the NPM_TOKEN secret
+        # in the GitHub repository (Settings > Secrets and variables > Actions).
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
