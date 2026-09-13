@@ -9,9 +9,18 @@ COPY bin ./bin
 COPY src ./src
 COPY .env.example README.md LICENSE ./
 
-# Default STATS_FILE is ./.openai-proxy-server/stats.json - keep it writable for the
-# non-root user (secrets never baked in; pass OPENAI_*/TTS_*/STT_*/LIMITS via -e or a mounted .env).
-RUN mkdir -p .openai-proxy-server && chown -R node:node /app
+# Runtime only needs the node binary (no external deps, no npm scripts) -
+# drop npm/npx/corepack/yarn and their docs to shrink the image.
+RUN rm -rf \
+      /usr/local/lib/node_modules/npm \
+      /usr/local/lib/node_modules/corepack \
+      /usr/local/bin/npm \
+      /usr/local/bin/npx \
+      /usr/local/bin/yarn \
+      /usr/local/bin/yarnpkg \
+      /usr/local/bin/corepack \
+      /opt/yarn-* \
+  && mkdir -p .openai-proxy-server && chown -R node:node /app
 USER node
 
 ENV HOST=0.0.0.0
