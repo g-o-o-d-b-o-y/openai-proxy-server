@@ -313,25 +313,6 @@ The default bind address is `0.0.0.0`, so the proxy is reachable from any device
 
 The logs intentionally do **not** record request/response bodies, prompts, transcripts, audio, or Authorization headers.
 
-## Publishing to npm
-
-Before the first publication, edit the `author` and `repository` fields in `package.json` for your GitHub repository. Also verify that the package name is available; if `openai-proxy-server` is already owned by someone else, use a scoped package such as `@yourname/openai-proxy-server` (the CLI name can still remain `openai-proxy-server`).
-
-Manual first publish:
-
-```bash
-npm login
-npm publish --access public
-```
-
-After the package exists, the included workflow `.github/workflows/publish.yml` publishes on a GitHub Release (or manual `workflow_dispatch` run) using an npm token. To set it up:
-
-1. Create an npm **Automation** (publish-only) access token at <https://www.npmjs.com/settings/yourname/tokens>.
-2. Add it as the `NPM_TOKEN` secret in your GitHub repository (Settings → Secrets and variables → Actions).
-3. Trigger a Release (or run the workflow manually) — the publish job authenticates via `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`.
-
-For per-step scoped instead of repository-wide access, you can pass the secret only to the publish job. Trusted Publishing (OIDC) is also supported by npm if you prefer to avoid token management.
-
 ## Development
 
 ```bash
