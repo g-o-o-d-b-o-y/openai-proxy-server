@@ -1,378 +1,233 @@
 # openai-proxy-server
 
-A small OpenAI-compatible reverse proxy for **LLM + TTS + STT**. Point an OpenAI-compatible client at:
+An OpenAI-compatible reverse proxy for **LLM + TTS + STT** that works as a small **API reseller platform**: visitors generate their own keys, every request is metered against an account balance with a configurable markup, and the administrator manages keys, limits, credits and subscriptions from a black, responsive dashboard.
 
 ```text
-http://localhost:56787/v1
+API:        http://localhost:56787/v1
+Landing:    http://localhost:56787/           self-service keys and plans
+Key board:  http://localhost:56787/key/       per-key usage dashboard
+Admin:      http://localhost:56787/dashboard/    keys, accounts, billing, settings
 ```
 
-The proxy selects the upstream for ordinary OpenAI requests, text-to-speech, and speech-to-text; injects configured defaults; preserves streaming responses; and exposes a tiny real-time dashboard with request logs and usage counters.
+## Highlights
 
-## Features
-
-- Generic reverse proxy for `/v1/*` — not limited to a hard-coded endpoint list.
-- Separate upstream URL / API key / model for LLM, TTS, and STT.
-- `POST /v1/audio/speech` routes through the TTS config.
-- `POST /v1/audio/transcriptions` and `/v1/audio/translations` route through the STT config.
-- SSE/chunked streaming is forwarded immediately, without buffering the whole response.
-- Binary audio is streamed unchanged.
-- Multipart uploads (for standard OpenAI STT clients) are streamed unchanged.
-- HTTP WebSocket upgrades are tunneled for realtime-style endpoints.
-- Optional local API key (`PROXY_API_KEY`).
-- Live dashboard and SSE telemetry at `/_proxy/`.
-- Persistent aggregate stats + recent logs in `.openai-proxy-server/stats.json` by default.
-- No prompt/audio contents are written to the request log; only metadata/usage is retained.
+- **Self-service keys** — one click or `POST /v1/keys`; keys are shown once and stored as HMAC hashes.
+- **Reseller billing** — customers pay `upstream_cost × (1 + markup%)`. Provider-reported costs win; otherwise a configurable price table estimates tokens and audio seconds. Money is stored as integer micro-USD, so balances never drift.
+- **Accounts with shared balances** — every key belongs to an account. Credit lots (free, subscription, purchase, admin) are consumed soonest-expiring-first.
+- **Subscriptions** — seed plans (`$20/30d`, `$100/180d` or your own) grant expiring credit and remove the per-IP key limit; all keys on the account share the balance.
+- **Block & rotate** — block a key and mint a replacement with the same account and limits; dashboard access survives blocking.
+- **Per-key limits** — spend, tokens, requests, requests/minute, model allowlist and expiry.
+- **Abuse protection** — self-service keys default to **2 per IP per month** plus a cooldown and a global hourly cap; the check and insert are one transaction, so parallel requests cannot overshoot.
+- **SQLite everything** — settings, keys, accounts, credits, usage and logs live in one strict-schema database. Environments variable only seed the first start.
+- **Zero runtime dependencies** — Node's built-in `node:sqlite`.
 
 ## Quick start
 
-Create `.env` in the directory where you run the command:
+```bash
+npm install
+cp .env.example .env    # add your upstream keys
+npm start
+```
+
+Minimal `.env`:
 
 ```dotenv
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
-OPENAI_API_KEY=sk-or-v1-
+OPENAI_API_KEY=sk-or-v1-...
 OPENAI_MODEL=google/gemma-4-26b-a4b-it
-
-TTS_BASE_URL=https://openrouter.ai/api/v1
-TTS_API_KEY=sk-or-v1-
-TTS_MODEL=qwen/qwen-audio-3.0-tts-flash
-TTS_VOICE=longanhuan_v3.6
-
-STT_BASE_URL=https://openrouter.ai/api/v1
-STT_API_KEY=sk-or-v1-
-STT_MODEL=qwen/qwen3-asr-flash-2026-02-10
+ADMIN_TOKEN=change-me
 ```
 
-Then run:
+Or with npx:
 
 ```bash
 npx openai-proxy-server
 ```
 
-Expected endpoints:
+The server binds `0.0.0.0` by default and prints the local/LAN URLs. Set `HOST=127.0.0.1` to restrict it to this machine.
+
+## How it works
+
+### Accounts and credit
+
+Each `POST /v1/keys` creates an **account** with an evaluation credit (`FREE_CREDIT_USD`, default `$0.25`) and one API key. Credits are a ledger of lots:
+
+| Source | Created by | Expiry |
+|---|---|---|
+| `free` | first key of a new account | `FREE_CREDIT_EXPIRY_DAYS` (0 = never) |
+| `subscription` | granting/redeeming a plan | plan period end |
+| `purchase` | credit code or admin top-up | optional |
+| `admin` / `refund` | administrator | optional |
+
+Spendable balance = unexpired lots with a positive remainder. Requests consume the soonest-expiring lot first. Balance checks are soft: an in-flight request may overshoot a near-empty balance; the next request gets `402 insufficient_balance`.
+
+### Markup
 
 ```text
-OpenAI base URL: http://localhost:56787/v1
-Dashboard:       http://localhost:56787/_proxy/
+upstream_cost = provider usage.cost  OR  price-table estimate
+billed        = upstream_cost × (1 + markup_pct / 100)
 ```
 
-By default the server binds `0.0.0.0`, so it is also reachable from any device on the same network. The startup banner prints the exact network URL(s), for example:
+Markup resolution: **key → account → global**. Price table format (USD per 1M tokens, USD per audio second):
 
-```text
-[openai-proxy-server] LAN API:       http://192.168.1.23:56787/v1
-[openai-proxy-server] LAN Dashboard: http://192.168.1.23:56787/_proxy/
-```
-
-Replace `192.168.1.23` with the LAN IP printed when you start it. Opening the bare host (`http://host:port/`) redirects to the dashboard.
-
-For local source checkout:
-
-```bash
-npm install
-npm start
-```
-
-## Docker
-
-A small Alpine image is published to GitHub Container Registry for `linux/amd64` and `linux/arm64`:
-
-```bash
-docker pull ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
-docker run -d -p 56787:56787 \
-  -e OPENAI_API_KEY=sk-or-v1-... \
-  -e OPENAI_BASE_URL=https://openrouter.ai/api/v1 \
-  -e OPENAI_MODEL=google/gemma-4-26b-a4b-it \
-  ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
-```
-
-Open `http://localhost:56787/` for the live dashboard. Pass `TTS_API_KEY`, `STT_API_KEY`, `LIMITS`, etc. the same way, or mount a `.env` file instead:
-
-```bash
-docker run -d -p 56787:56787 -v "$PWD/.env:/app/.env" \
-  -v oproxy-stats:/app/.openai-proxy-server \
-  ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
-```
-
-The image runs as the non-root `node` user, exposes port `56787`, and includes a `HEALTHCHECK` that pings the dashboard. Secrets are never baked into the image.
-
-## LLM example
-
-```bash
-curl http://localhost:56787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-anything" \
-  -d '{
-    "messages": [{"role":"user","content":"How many r`s are in strawberry?"}],
-    "reasoning": {"enabled": true},
-    "stream": true
-  }'
-```
-
-If `model` is omitted from a JSON request, `OPENAI_MODEL` is inserted when `MODEL_POLICY=default` (the default).
-
-## TTS example
-
-```bash
-curl http://localhost:56787/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-anything" \
-  --output output.mp3 \
-  -d '{
-    "input": "Hello! This is a text-to-speech test."
-  }'
-```
-
-The proxy fills `TTS_MODEL` and `TTS_VOICE` when they are absent.
-
-## STT example: OpenRouter JSON audio input
-
-```bash
-AUDIO_BASE64=$(base64 < audio.wav | tr -d '\n')
-
-curl http://localhost:56787/v1/audio/transcriptions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-anything" \
-  -d '{
-    "input_audio": {
-      "data": "'"$AUDIO_BASE64"'",
-      "format": "wav"
-    }
-  }'
-```
-
-`STT_MODEL` is inserted for JSON requests when the request does not include a model.
-
-## OpenAI SDK examples
-
-JavaScript:
-
-```js
-import OpenAI from 'openai';
-
-const client = new OpenAI({
-  baseURL: 'http://localhost:56787/v1',
-  apiKey: 'local-anything'
-});
-
-const stream = await client.chat.completions.create({
-  model: 'ignored-only-if-MODEL_POLICY=force',
-  messages: [{ role: 'user', content: 'Hello' }],
-  stream: true
-});
-
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices?.[0]?.delta?.content || '');
+```json
+{
+  "google/gemma-4-26b-a4b-it": { "input": 0.06, "output": 0.12 },
+  "qwen/qwen-audio-3.0-tts-flash": { "audio_second": 0.001 },
+  "default": { "input": 0.5, "output": 1.5 }
 }
 ```
 
-Python:
+TTS providers that stream audio without a usage object get their duration estimated from the stream (`audio/pcm`, `audio/wav`), so audio can be priced too.
 
-```python
-from openai import OpenAI
+### Subscriptions and keys
 
-client = OpenAI(
-    base_url="http://localhost:56787/v1",
-    api_key="local-anything",
-)
+Plans are rows in the database and editable in the admin UI. A plan grants a credit lot expiring at the end of its period and marks the account as subscribed:
 
-response = client.chat.completions.create(
-    model="any-model-name",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-print(response.choices[0].message.content)
+- subscribed accounts **bypass the per-IP key limit**;
+- additional keys are created through `POST /v1/keys` with an existing key/dashboard token;
+- blocking a key and rotating it keeps the account, balance and limits.
+
+Payments are intentionally not built in. Issue **redeem codes** (plan or credit) in the admin UI and let users redeem them at `/key/` or `POST /v1/account/redeem`. A payment provider only needs to call the same grant path.
+
+### Abuse limits
+
+Self-service keys default to **2 per IP per calendar month**, a 30-second cooldown and a global 100/hour cap. This is deliberately conservative: it stops one script from mining unlimited evaluation credit while leaving room for a normal user with two devices. Shared NAT and VPN addresses can collide — raise `keys.ip_limit_per_month`, add per-IP overrides (`{"203.0.113.7": 10}`), or grant a subscription, which exempts the account. Behind Cloudflare/nginx enable `server.trust_proxy` so limits see real client IPs.
+
+## Proxy usage
+
+Any OpenAI-compatible client works:
+
+```bash
+curl http://localhost:56787/v1/chat/completions \
+  -H "Authorization: Bearer sk-opx-..." \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-## Routing
+Routing: `/v1/audio/speech` → TTS upstream, `/v1/audio/transcriptions|translations` → STT upstream, everything else under `/v1/*` → LLM upstream. The local `/v1` prefix is replaced by the path in the configured base URL; query strings are preserved. WebSocket upgrades are tunneled (not metered).
 
-| Incoming path | Upstream configuration |
-|---|---|
-| `/v1/audio/speech` | `TTS_*` |
-| `/v1/audio/transcriptions` | `STT_*` |
-| `/v1/audio/translations` | `STT_*` |
-| everything else under `/v1/*` | `OPENAI_*` |
-
-The local `/v1` prefix is replaced by the path already present in the configured base URL. For example:
+Responses carry:
 
 ```text
-local:    http://localhost:56787/v1/chat/completions
-upstream: https://openrouter.ai/api/v1/chat/completions
+X-Request-Id: 5e04d57e
+X-Key-Prefix: sk-opx-EHVSXRI
+X-Account-Balance-USD: 0.249907
+X-Model-Fallback: backup-model        (when a fallback served the request)
 ```
 
-Query strings are preserved.
+Failure codes: `401 invalid_api_key|key_blocked|key_revoked|key_expired|missing_api_key`, `402 insufficient_balance`, `403 account_suspended|model_not_allowed`, `429 spend_limit_exceeded|token_limit_exceeded|request_limit_exceeded|rate_limit_exceeded|ip_key_limit|creation_cooldown|creation_rate_limited`, `413 request_too_large`.
 
-## Model policy
+Model policy (`default`/`force`/`passthrough`) and fallback chains apply only to JSON requests using the configured model; multipart bodies stream through untouched.
 
-```dotenv
-MODEL_POLICY=default
-VOICE_POLICY=default
-```
+## Customer API
 
-Supported values:
-
-- `default`: insert the configured value only when a JSON request omitted it.
-- `force`: overwrite the corresponding field in JSON requests.
-- `passthrough`: never change it.
-
-Multipart bodies are deliberately streamed as-is. This keeps standard OpenAI file/audio uploads compatible and memory-efficient; their `model` field is therefore not rewritten by `MODEL_POLICY=force`.
-
-## Local API authentication
-
-By default the proxy accepts any client Authorization header (or none) and replaces it with the appropriate upstream API key.
-
-To require a local key:
-
-```dotenv
-PROXY_API_KEY=my-local-secret
-```
-
-Then clients must send:
+Send an API key or dashboard token as `Authorization: Bearer`. `POST /v1/keys` and `GET /v1/plans` are public.
 
 ```text
-Authorization: Bearer my-local-secret
+GET    /v1/plans                 active plans
+POST   /v1/keys                  create a key (account-scoped when authenticated)
+GET    /v1/keys                  list keys with 30-day usage
+PATCH  /v1/keys/:id              rename or block a key
+POST   /v1/keys/:id/rotate       block and replace a key
+GET    /v1/account               balance, credits, subscription, limits usage
+GET    /v1/account/usage?days=30&key=…       daily series + breakdown
+GET    /v1/account/requests?limit=20&key=…   request history
+POST   /v1/account/redeem        { "code": "OPX-…" }
 ```
 
-The upstream keys are never returned to the client.
+Example:
 
-## Limits / quotas
-
-You can configure one or more usage quotas in `LIMITS` (JSON array). Each rule optionally matches a model and/or route kind, and counts a metric over a rolling window per IP address (or globally):
-
-```dotenv
-# max 2,000,000 tokens per IP for this model over a rolling 7 days
-LIMITS=[{"metric":"tokens","scope":"ip","window":"7d","max":2000000,"model":"google/gemma-4-26b-a4b-it"}]
-# max 100 requests per IP per hour
-LIMITS=[{"metric":"requests","scope":"ip","window":"1h","max":100}]
+```bash
+curl -X POST http://localhost:56787/v1/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"my-laptop","contact":"me@example.com"}'
 ```
 
-Fields per rule:
+## Admin API
 
-- `metric` — `tokens` (counts `usage.total_tokens` from the upstream response) or `requests` (always 1).
-- `scope` — `ip` buckets usage per client IP; `all` is one shared bucket.
-- `window` — rolling period: `1h`, `24h`, `7d`, `30d`, or a millisecond number.
-- `max` — the allowance per window.
-- `model` — optional exact model matcher (case-insensitive); omit to match any model.
-- `kind` — optional exact matcher: `openai` (LLM), `tts`, `stt`.
-- `name` — optional label shown in the dashboard/API.
-
-Behavior:
-
-- Quotas are **soft**: a request is allowed while usage `< max`; once a completed request pushes usage to `max`, later matching requests are rejected with **HTTP 429 `quota_exceeded`** (with the quota details in the JSON body) **before** hitting the upstream, so no tokens are spent.
-- Every proxied response includes quota headers for the tightest matching rule: `X-Quota-Used`, `X-Quota-Max`, `X-Quota-Remaining`, `X-Quota-Remaining-Pct`, `X-Quota-Window`, `X-Quota-Metric` (429 responses include them too).
-- The dashboard's **Quota** column shows a remaining-percentage bar for each request; the same `quota` object is included in `/api/logs` entries.
-- Model matchers apply to JSON requests (the model is known after injection). Rules **without** a `model` matcher also apply to multipart/streamed uploads (matched by route `kind` or applied globally); token counting for those still needs a `usage` object in the response.
-- Quota accounting lives in memory (reset on restart), like `stats`; usage without a `usage` object in the response counts 0 tokens.
-
-## Dashboard and stats
-
-Open:
+Served under the dashboard path (`/dashboard/api`) with the admin token in `x-admin-token`, `Authorization: Bearer` or `?token=`. With no token configured the dashboard is open (development mode, a startup warning is printed).
 
 ```text
-http://localhost:56787/_proxy/
+GET    /api/overview
+GET    /api/keys?q=&status=&limit=&offset=
+GET    /api/keys/:id
+PATCH  /api/keys/:id             name, status, limits, markup_pct, expires_at
+POST   /api/keys/:id/rotate
+POST   /api/keys/:id/revoke
+GET    /api/accounts?q=&status=&limit=&offset=
+GET    /api/accounts/:id
+PATCH  /api/accounts/:id         status, contact, note, markup_pct, can_create_keys
+POST   /api/accounts/:id/credits        { amount_usd, source, expires_at?, note? }
+POST   /api/accounts/:id/subscriptions  { plan_code }
+POST   /api/accounts/:id/keys
+GET    /api/plans ;  POST /api/plans
+GET    /api/codes ;  POST /api/codes
+GET    /api/requests?q=&kind=&model=&status=&hour=&key=&account=&limit=&offset=
+GET    /api/requests/groups?field=model|ip|status|kind|path|key|hour
+GET    /api/settings ; PATCH /api/settings
+GET    /api/events              server-sent events (snapshot on change)
 ```
 
-The dashboard shows in real time:
+## Configuration
 
-- total and active requests;
-- errors;
-- input/output bytes;
-- token usage when the upstream returns a standard `usage` object;
-- provider-reported cost when present in `usage.cost`/`usage.total_cost`;
-- recent request metadata, client IP, model, status, latency and response size.
+Environment variables seed the settings table on first start. After that the database is authoritative and every setting is editable in **Admin → Settings**:
 
-![OpenAI Proxy Server dashboard](scr.png)
+- **upstreams** — LLM/TTS/STT base URL, key, model, voice, fallback chains, policies, OpenRouter attribution;
+- **billing** — markup, free credit and expiry, price table;
+- **keys** — require-key mode, IP limit, cooldown, global cap, max keys per account, default limits, IP overrides, token prefixes;
+- **server** — CORS, body limits, upstream timeout, log level/retention/entries, trust proxy;
+- **dashboard** — enabled, path, site title, admin token.
 
-Logs can be grouped (top IPs, models, methods, status codes, types, paths, hours) and filtered. Pick a grouping from the "Group by…" menu and click any group to filter; active filters appear as removable chips (with a "Clear all" shortcut). The search box filters across path, model, method, IP, status and errors. "Group by hour" shows the most recent 24 hours.
+Secrets are never returned by the API; leave a secret field blank to keep its current value.
 
-API endpoints:
+### Running without API keys
 
-```text
-GET /_proxy/api/stats
-GET /_proxy/api/logs?limit=&offset=&kind=&ip=&model=&method=&status=&path=&hour=&q=
-GET /_proxy/api/groups?field=ip|model|method|status|kind|path|hour&limit=&kind=&ip=&model=&method=&status=&path=&hour=&q=
-GET /_proxy/api/quota   # current limits + remaining usage for the requesting IP
-GET /_proxy/events      # Server-Sent Events
-```
+Set `keys.require_key` to `false` (env `REQUIRE_KEY=false`) to let clients call the proxy without a key. Anonymous requests are logged, count toward upstream totals and can still be rate limited by your infrastructure, but they are never billed (there is no account to charge). If your clients always send a placeholder bearer token (many SDKs require an `apiKey` value), also enable `keys.accept_any_token` (env `ACCEPT_ANY_TOKEN=true`); unknown tokens are then treated as anonymous. In required mode unknown tokens are always rejected with `401 invalid_api_key`.
 
-`/api/logs` returns `{ total, logs }` (newest first) when any filter or pagination parameter is present, and a plain array otherwise. Filters in `/api/logs` are: `kind`, `ip`, `model`, `method` (exact), `status` (exact), `path` (exact) and `hour` (the UTC hour prefix, e.g. `2026-09-13T03`), plus `q` for free-text search. `/api/groups` returns `{ field, total, groups }` where each group has `key`, `label`, `count`, `totalTokens`, `cost`, `audioSeconds` and `bytesOut`, sorted by descending count (newest first for `hour`).
+## Storage
 
-The dashboard is exposed to your network by default, so set a token to protect it (and `PROXY_API_KEY` to protect the API):
+One SQLite file (`DB_FILE`, default `.openai-proxy-server/proxy.db`, WAL mode) with a strict, checked schema:
 
-```dotenv
-DASHBOARD_TOKEN=dashboard-secret
-```
+- `settings` — runtime configuration;
+- `accounts`, `api_keys`, `dash_tokens` — identity (only HMAC/SHA-256 hashes stored);
+- `credits`, `subscriptions`, `plans`, `redeem_codes` — billing;
+- `usage_buckets` — hourly per-key/model aggregates in micro-USD (charts + windowed limits);
+- `request_logs` — request metadata (never prompts or audio), pruned by entries/retention;
+- `totals` — global counters for the live dashboard.
 
-Then open:
-
-```text
-http://localhost:56787/_proxy/?token=dashboard-secret
-```
-
-Stats persist to:
-
-```dotenv
-STATS_FILE=.openai-proxy-server/stats.json
-MAX_LOG_ENTRIES=1000
-```
-
-## Streaming and usage notes
-
-The proxy never waits for the complete upstream body before forwarding it. SSE, chunked text, and binary audio are streamed immediately.
-
-Usage accounting is exact only when the upstream includes a `usage` object. For streamed chat responses, many OpenAI-compatible servers require the caller to request streaming usage explicitly (for example through `stream_options.include_usage`). This proxy does not silently change that option, so it will not invent token counts when the provider omits them.
-
-## Configuration reference
-
-```dotenv
-# 0.0.0.0 binds every interface (reachable from your network);
-# 127.0.0.1 restricts to this machine only.
-HOST=0.0.0.0
-PORT=56787
-DASHBOARD=true
-DASHBOARD_PATH=/_proxy
-PROXY_API_KEY=
-DASHBOARD_TOKEN=
-
-OPENAI_BASE_URL=https://openrouter.ai/api/v1
-OPENAI_API_KEY=
-OPENAI_MODEL=
-
-TTS_BASE_URL=
-TTS_API_KEY=
-TTS_MODEL=
-TTS_VOICE=
-
-STT_BASE_URL=
-STT_API_KEY=
-STT_MODEL=
-
-MODEL_POLICY=default
-VOICE_POLICY=default
-MAX_JSON_BODY_MB=50
-MAX_STREAM_BODY_MB=512
-UPSTREAM_TIMEOUT_MS=0
-STATS_FILE=.openai-proxy-server/stats.json
-MAX_LOG_ENTRIES=1000
-LOG_LEVEL=info
-CORS_ORIGIN=*
-
-OPENROUTER_HTTP_REFERER=
-OPENROUTER_X_TITLE=
-```
-
-`TTS_BASE_URL`/`TTS_API_KEY` and `STT_BASE_URL`/`STT_API_KEY` fall back to the `OPENAI_*` values when omitted.
+Schema changes ship as ordered migrations in `src/db.js` and are tracked in `schema_migrations`. Version 0.5 uses a fresh schema and does not migrate older databases: point `DB_FILE` at a new path (or move the old file aside) when upgrading from 0.4 or earlier.
 
 ## Security
 
-The default bind address is `0.0.0.0`, so the proxy is reachable from any device on your network — including the authenticated upstream calls and the dashboard. For anything beyond a trusted home network, set `PROXY_API_KEY` and `DASHBOARD_TOKEN`; otherwise anyone on the network can use your upstream keys through the proxy. Use `HOST=127.0.0.1` to restrict to the local machine. Do not commit `.env`.
-
-The logs intentionally do **not** record request/response bodies, prompts, transcripts, audio, or Authorization headers.
+- Set `ADMIN_TOKEN` (or an admin token in Settings) before exposing the server.
+- Keys and dashboard tokens are irreversible HMAC hashes; rotating `security.key_pepper` invalidates every key.
+- `REQUIRE_KEY=true` by default: only existing keys are accepted, and unknown tokens are rejected even in open mode.
+- Enable `trust_proxy` only behind a proxy you control, otherwise clients can spoof `X-Forwarded-For`.
+- Logs never include bodies, prompts, transcripts, audio or Authorization headers.
 
 ## Development
 
 ```bash
-npm install
-npm test
-npm run check
+npm test        # 50+ unit/integration tests (in-memory SQLite, fake upstreams)
+npm run check   # syntax-check every entry point
 ```
+
+Requires **Node.js ≥ 22.13** (`node:sqlite`). No runtime dependencies.
+
+## Docker
+
+```bash
+docker run -d -p 56787:56787 \
+  -e OPENAI_BASE_URL=https://openrouter.ai/api/v1 \
+  -e OPENAI_API_KEY=sk-or-v1-... \
+  -e OPENAI_MODEL=google/gemma-4-26b-a4b-it \
+  -e ADMIN_TOKEN=change-me \
+  -v opx-data:/app/.openai-proxy-server \
+  ghcr.io/g-o-o-d-b-o-y/openai-proxy-server
+```
+
+The image runs as the non-root `node` user with a healthcheck; mount the data volume to keep the database.
 
 ## License
 

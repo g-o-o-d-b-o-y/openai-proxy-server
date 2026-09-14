@@ -1,95 +1,55 @@
+// HTTP server: dashboard pages, customer API, admin API and the proxied
+// OpenAI-compatible traffic.
+//
+// Requests fall through in this order:
+//   1. favicon and public pages (landing, key dashboard, admin shell)
+//   2. dashboard admin API and events
+//   3. customer API under /v1 (keys, account, usage)
+//   4. proxied /v1 traffic
+//
+// Only existing DB keys are accepted; `keys.require_key` controls whether a
+// request without any token is allowed (anonymous traffic is logged but not
+// billed).
+
 import http from 'node:http';
 import https from 'node:https';
 import { Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import { classifyRoute, buildUpstreamUrl, patchJsonBody, routeConfig } from './routing.js';
-import { serveDashboard, serveFavicon } from './dashboard.js';
-import { StatsStore } from './stats.js';
+import { buildUpstreamUrl, classifyRoute, patchJsonBody, upstreamFor } from './routing.js';
+import { createDashboard, serveFavicon, serveKeyDashboard, serveLanding } from './dashboard.js';
+import { createCustomerApi } from './api/customer.js';
+import { createAdminApi } from './api/admin.js';
+import { estimateAudioMs } from './audio.js';
+import { jsonError, remoteIp, sendJson } from './http.js';
+import { formatUsd } from './money.js';
 import { paint, statusStyle, routeLabel, formatDuration, humanBytes, formatCount, ellipsize, PREFIX } from './term.js';
-import { QuotaStore, withRuleIds, matchRules, quotaSnapshots, strictest, denyReason, scopeValue } from './quota.js';
 
-const HOP_BY_HOP = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
+const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+const CAPTURE_LIMIT = 4 * 1024 * 1024;
 
 function copyRequestHeaders(headers, upstream, config) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
     const lower = key.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || lower === 'host' || lower === 'authorization' || lower === 'content-length' || lower === 'accept-encoding') continue;
+    if (HOP_BY_HOP.has(lower) || ['host', 'authorization', 'x-api-key', 'content-length', 'accept-encoding'].includes(lower)) continue;
     if (value != null) out[key] = value;
   }
   if (upstream.apiKey) out.authorization = `Bearer ${upstream.apiKey}`;
   out['accept-encoding'] = 'identity';
-  if (config.openrouterReferer) out['HTTP-Referer'] = config.openrouterReferer;
-  if (config.openrouterTitle) out['X-Title'] = config.openrouterTitle;
+  if (config.openrouter.referer) out['HTTP-Referer'] = config.openrouter.referer;
+  if (config.openrouter.title) out['X-Title'] = config.openrouter.title;
   return out;
 }
 
-function copyResponseHeaders(headers, corsOrigin) {
+function copyResponseHeaders(headers, config) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
     if (HOP_BY_HOP.has(key.toLowerCase()) || value == null) continue;
     out[key] = value;
   }
-  if (corsOrigin) out['access-control-allow-origin'] = corsOrigin;
+  if (config.server.corsOrigin) out['access-control-allow-origin'] = config.server.corsOrigin;
   return out;
 }
-
-function jsonError(res, status, code, message, config) {
-  const body = JSON.stringify({ error: { message, type: code, code } });
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-    ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {})
-  });
-  res.end(body);
-}
-
-function quotaHeaders(snapshot) {
-  if (!snapshot) return {};
-  return {
-    'x-quota-used': String(snapshot.used),
-    'x-quota-max': String(snapshot.max),
-    'x-quota-remaining': String(snapshot.remaining),
-    'x-quota-remaining-pct': String(snapshot.pct),
-    'x-quota-window': snapshot.windowLabel,
-    'x-quota-metric': snapshot.metric,
-    'x-quota-key': snapshot.scope === 'ip' ? snapshot.key : 'all'
-  };
-}
-
-function quotaError(res, config, reason, snapshot) {
-  const body = JSON.stringify({ error: { message: reason, type: 'quota_exceeded', code: 'quota_exceeded', quota: snapshot } });
-  res.writeHead(429, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-    'cache-control': 'no-store',
-    ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {}),
-    ...quotaHeaders(snapshot)
-  });
-  res.end(body);
-}
-
-function authorized(req, config) {
-  if (!config.proxyApiKey) return true;
-  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
-  return token === config.proxyApiKey;
-}
-
-async function readJsonBody(req, maxBytes) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > maxBytes) {
-      const error = new Error(`JSON request body exceeds ${Math.round(maxBytes / 1024 / 1024)} MB`);
-      error.statusCode = 413;
-      throw error;
-    }
-    chunks.push(chunk);
-  }
-  return { buffer: Buffer.concat(chunks), size };
-}
-
 
 function findUsage(value) {
   if (!value || typeof value !== 'object') return null;
@@ -105,87 +65,90 @@ function parseUsageFromBuffer(buffer, contentType) {
       if (!line.startsWith('data:')) continue;
       const raw = line.slice(5).trim();
       if (!raw || raw === '[DONE]') continue;
-      try { const obj = JSON.parse(raw); const usage = findUsage(obj); if (usage) found = usage; } catch {}
+      try {
+        const usage = findUsage(JSON.parse(raw));
+        if (usage) found = usage;
+      } catch { /* not a JSON event */ }
     }
     return found;
   }
   if (contentType.includes('json')) {
-    try { return findUsage(JSON.parse(text)); } catch {}
+    try { return findUsage(JSON.parse(text)); } catch { /* invalid JSON */ }
   }
   return null;
 }
 
-// Paths that are never OpenAI-compatible API traffic (browser/service probes and
-// assets automatically fetched by browsers when an upstream HTML page is rendered).
-// They are answered locally, never proxied upstream, and never logged or counted.
+// Browser/service probes and assets are never API traffic; answering them
+// locally avoids noisy logs and upstream 404 HTML pages.
 function isBrowserNoise(pathname) {
-  const p = String(pathname || '').toLowerCase();
-  return p === '/robots.txt' || p === '/manifest.json' || p === '/manifest.webmanifest'
-    || p === '/sitemap.xml' || p === '/asset-manifest.json'
-    || p === '/.env' || p === '/.git/config'
-    || p === '/.well-known' || p.startsWith('/.well-known/')
-    || p.startsWith('/apple-touch-icon')
-    || p === '/favicon.ico' || p === '/favicon.svg' || p.startsWith('/favicon/')
-    || p === '/sw.js' || p === '/service-worker.js'
-    || p.startsWith('/_next/') || p.startsWith('/_nuxt/')
-    || p.startsWith('/cdn-cgi/');
+  const path = String(pathname || '').toLowerCase();
+  return path === '/robots.txt' || path === '/manifest.json' || path === '/manifest.webmanifest'
+    || path === '/sitemap.xml' || path === '/asset-manifest.json'
+    || path === '/.env' || path === '/.git/config'
+    || path === '/.well-known' || path.startsWith('/.well-known/')
+    || path.startsWith('/apple-touch-icon')
+    || path === '/favicon.ico' || path === '/favicon.svg' || path.startsWith('/favicon/')
+    || path === '/sw.js' || path === '/service-worker.js'
+    || path.startsWith('/_next/') || path.startsWith('/_nuxt/')
+    || path.startsWith('/cdn-cgi/');
 }
 
-function logLine(config, log) {
-  if (config.logLevel === 'silent') return;
-  const time = new Date(log.time).toTimeString().slice(0, 8);
-  const status = log.status || 'ERR';
+function logLine(config, request) {
+  if (config.server.logLevel === 'silent') return;
+  const time = new Date(request.time).toTimeString().slice(0, 8);
+  const status = request.status || 'ERR';
   const parts = [
     paint(time, 'gray'),
-    paint(log.method, 'cyan'),
-    ellipsize(log.path),
-    paint(routeLabel(log.kind), 'magenta'),
+    paint(request.method, 'cyan'),
+    ellipsize(request.path),
+    paint(routeLabel(request.kind), 'magenta'),
     paint(String(status), statusStyle(status)),
-    paint(formatDuration(log.durationMs), 'gray')
+    paint(formatDuration(request.durationMs), 'gray')
   ];
-  if (log.usage?.totalTokens) parts.push(paint(`${formatCount(log.usage.totalTokens)} tok`, 'yellow'));
-  if (log.bytesOut >= 1024) parts.push(paint(humanBytes(log.bytesOut), 'gray'));
-  if (log.clientIp) parts.push(paint(log.clientIp, 'gray'));
-  if (log.error) parts.push(paint(`error=${log.error}`, 'red'));
+  if (request.keyPrefix) parts.push(paint(request.keyPrefix, 'blue'));
+  if (request.usage?.totalTokens) parts.push(paint(`${formatCount(request.usage.totalTokens)} tok`, 'yellow'));
+  if (request.billedCostUsd) parts.push(paint(`billed ${formatUsd(request.billedCostUsd)}`, 'cyan'));
+  if (request.fallback) parts.push(paint(`fallback=${request.fallback}`, 'magenta'));
+  if (request.bytesOut >= 1024) parts.push(paint(humanBytes(request.bytesOut), 'gray'));
+  if (request.clientIp) parts.push(paint(request.clientIp, 'gray'));
+  if (request.error) parts.push(paint(`error=${request.error}`, 'red'));
   console.log(`${paint(`${PREFIX} `, 'dim')}${parts.join(' ')}`);
 }
 
-export function createProxyServer(config, stats = new StatsStore({ file: config.statsFile, maxLogs: config.maxLogEntries })) {
-  const quotaStore = new QuotaStore();
-  const quotaRules = Array.isArray(config.limits) ? withRuleIds(config.limits) : [];
+export function createProxyServer(config, usage, { keys, accounts, settings } = {}) {
+  const handleCustomerApi = createCustomerApi({ config, db: keys.db, keys, accounts, usage });
+  const handleAdminApi = createAdminApi({ config, keys, accounts, usage, settings });
+  const handleDashboard = createDashboard({ config, keys, usage, adminApi: handleAdminApi, settings });
 
-  const server = http.createServer(async (req, res) => {
-    if (serveFavicon(req, res, { config })) return;
+  const handleRequest = async (req, res) => {
+    if (serveFavicon(req, res, config)) return;
+    if (serveLanding(req, res, { config, accounts })) return;
+    if (serveKeyDashboard(req, res, config)) return;
+    if (await handleDashboard(req, res)) return;
 
-    // Opening the bare host (http://host:port/) should reach the dashboard.
-    if (config.dashboard && (req.method === 'GET' || req.method === 'HEAD')) {
-      const probeUrl = new URL(req.url, 'http://localhost');
-      if (probeUrl.pathname === '/' || probeUrl.pathname === '') {
-        res.writeHead(302, { location: `${config.dashboardPath}/`, 'cache-control': 'no-store' });
-        res.end();
-        return;
-      }
-    }
+    const url = new URL(req.url, 'http://localhost');
+    if (await handleCustomerApi(req, res, url)) return;
 
-    if (serveDashboard(req, res, { config, stats, quotaStore, quotaRules })) return;
-
-    const localUrl = new URL(req.url, 'http://localhost');
-    if (isBrowserNoise(localUrl.pathname)) {
+    if (isBrowserNoise(url.pathname)) {
       jsonError(res, 404, 'not_found', 'Not found', config);
       return;
     }
 
-    // A bare GET /v1 (browser address bar or SDK base-URL probe) is answered
-    // locally instead of forwarding the upstream's 404 HTML page.
-    if ((req.method === 'GET' || req.method === 'HEAD') && (localUrl.pathname === '/v1' || localUrl.pathname === '/v1/')) {
+    // Bare GET /v1 is an SDK base-URL probe; answer locally.
+    if (['GET', 'HEAD'].includes(req.method || 'GET') && (url.pathname === '/v1' || url.pathname === '/v1/')) {
       const body = JSON.stringify({
         service: 'openai-proxy-server',
-        endpoints: { api: '/v1/chat/completions', dashboard: `${config.dashboardPath}/` }
+        endpoints: {
+          chat: '/v1/chat/completions',
+          keys: '/v1/keys',
+          account: '/v1/account',
+          dashboard: '/key/'
+        }
       });
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
         'content-length': Buffer.byteLength(body),
-        ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {})
+        ...(config.server.corsOrigin ? { 'access-control-allow-origin': config.server.corsOrigin } : {})
       });
       res.end(body);
       return;
@@ -193,22 +156,40 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        ...(config.corsOrigin ? { 'access-control-allow-origin': config.corsOrigin } : {}),
+        ...(config.server.corsOrigin ? { 'access-control-allow-origin': config.server.corsOrigin } : {}),
         'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-        'access-control-allow-headers': req.headers['access-control-request-headers'] || 'authorization,content-type',
+        'access-control-allow-headers': req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-admin-token',
         'access-control-max-age': '86400'
       });
       res.end();
       return;
     }
 
-    if (!authorized(req, config)) {
-      jsonError(res, 401, 'invalid_api_key', 'Invalid proxy API key', config);
+    if (!url.pathname.startsWith('/v1')) {
+      jsonError(res, 404, 'not_found', 'Not found', config);
       return;
     }
 
-    const kind = classifyRoute(localUrl.pathname);
-    const upstream = routeConfig(config, kind);
+    // ------------------------------------------------------------- identity
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim()
+      || String(req.headers['x-api-key'] || '').trim();
+    let identity = token ? keys.authenticate(token) : null;
+    if (token && !identity) {
+      // Open mode can treat placeholder tokens as anonymous (e.g. SDKs that
+      // require an apiKey value); required mode always rejects unknown tokens.
+      if (!config.keys.requireKey && config.keys.acceptAnyToken) identity = null;
+      else {
+        jsonError(res, 401, 'invalid_api_key', 'Invalid API key', config);
+        return;
+      }
+    }
+    if (!token && config.keys.requireKey) {
+      jsonError(res, 401, 'missing_api_key', 'An API key is required. Create one at POST /v1/keys', config);
+      return;
+    }
+
+    const kind = classifyRoute(url.pathname);
+    const upstream = upstreamFor(config, kind);
     if (!upstream.baseUrl) {
       jsonError(res, 500, 'proxy_configuration_error', `Missing upstream base URL for ${kind}`, config);
       return;
@@ -218,91 +199,98 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
       return;
     }
 
+    const requestMeta = usage.begin({
+      method: req.method,
+      path: url.pathname + url.search,
+      kind,
+      clientIp: remoteIp(req, config)
+    });
+    const keyInfo = identity ? { key: identity.key, account: identity.account } : null;
+    const preBalance = identity ? accounts.accountBalance(identity.account.id) : null;
     const target = buildUpstreamUrl(upstream.baseUrl, req.url);
-    const clientIp = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-    const requestMeta = stats.begin({ method: req.method, path: localUrl.pathname + localUrl.search, kind, clientIp });
     const contentType = String(req.headers['content-type'] || '').toLowerCase();
+    const hasBody = !['GET', 'HEAD'].includes(req.method || 'GET');
+    const isJson = hasBody && /(^|;)\s*application\/(?:[\w.+-]*\+)?json(?:\s*;|$)/i.test(contentType);
+
     let bytesIn = 0;
     let parsedModel = null;
+    let jsonValue = null;
     let bodyBuffer = null;
-    let upstreamReq;
+    let activeUpstreamReq = null;
+    let clientAborted = false;
     let finished = false;
-    let matchedQuotaRules = [];
-    let quotaDenied = false;
-    let quotaStrict = null;
+    let servedModel = upstream.model;
+
+    const meteringHeaders = () => ({
+      'x-request-id': requestMeta.id,
+      ...(identity ? { 'x-key-prefix': identity.key.keyPrefix } : {}),
+      ...(preBalance ? { 'x-account-balance-usd': String(preBalance.availableUsd) } : {})
+    });
 
     const finishOnce = (result) => {
       if (finished) return;
       finished = true;
-      const log = stats.finish(requestMeta, { bytesIn, ...result, quota: result.quota || quotaStrict });
-      if (matchedQuotaRules.length && !quotaDenied) {
-        for (const rule of matchedQuotaRules) {
-          const amount = rule.metric === 'requests' ? 1 : (log.usage?.totalTokens || 0);
-          quotaStore.record(rule, rule.ruleId, scopeValue(rule, clientIp), amount);
-        }
-        // Show the remaining AFTER this request consumed usage, so the first
-        // request is e.g. 98% (not 100%) once its tokens were counted.
-        const after = strictest(quotaSnapshots(quotaStore, matchedQuotaRules, clientIp));
-        if (after) log.quota = after;
-      }
-      logLine(config, log);
+      const request = usage.finish(requestMeta, { bytesIn, ...result, keyInfo });
+      logLine(config, request);
     };
 
-    try {
-      const hasBody = !['GET', 'HEAD'].includes(req.method || 'GET');
-      const isJson = hasBody && /(^|;)\s*application\/(?:[\w.+-]*\+)?json(?:\s*;|$)/i.test(contentType);
-      if (isJson) {
-        const read = await readJsonBody(req, config.maxJsonBodyBytes);
-        bytesIn = read.size;
-        if (read.buffer.length) {
-          let value;
-          try { value = JSON.parse(read.buffer.toString('utf8')); }
-          catch { throw Object.assign(new Error('Invalid JSON request body'), { statusCode: 400 }); }
-          patchJsonBody(value, { kind, upstream, modelPolicy: config.modelPolicy, voicePolicy: config.voicePolicy });
-          parsedModel = value?.model || null;
-          bodyBuffer = Buffer.from(JSON.stringify(value));
-        } else {
-          bodyBuffer = Buffer.alloc(0);
-        }
-      }
+    const deny = (result) => {
+      sendJson(res, result.status || 429, {
+        error: { code: result.code, message: result.message, ...(result.balance ? { balance: result.balance } : {}) }
+      }, config, {
+        ...(result.retryAfter ? { 'retry-after': String(Math.ceil(result.retryAfter)) } : {}),
+        ...meteringHeaders()
+      });
+      finishOnce({ status: result.status || 429, bytesOut: 0, error: result.message, countUsage: false, model: parsedModel || upstream.model });
+    };
 
-      // Quota pre-check (soft): reject before spending tokens upstream once the
-      // window allowance is exhausted. Model-based rules need a known model
-      // (JSON bodies); rules without a model matcher also apply to multipart
-      // uploads (matched by route kind).
-      if (quotaRules.length && (parsedModel !== null || quotaRules.some((rule) => !rule.model))) {
-        matchedQuotaRules = matchRules(quotaRules, { model: parsedModel, kind });
-        if (matchedQuotaRules.length) {
-          const snapshots = quotaSnapshots(quotaStore, matchedQuotaRules, clientIp);
-          quotaStrict = strictest(snapshots);
-          const denied = denyReason(snapshots);
-          if (denied) {
-            quotaDenied = true;
-            quotaError(res, config, denied, quotaStrict);
-            finishOnce({ status: 429, bytesOut: 0, error: denied, model: parsedModel || upstream.model, quota: quotaStrict });
-            return;
-          }
-        }
-      }
+    const retryableStatus = (status) => status >= 500 || [400, 402, 404, 408, 429].includes(status);
+    const isFallbackModel = (model) => model != null && model !== parsedModel;
 
+    const runAttempt = ({ model, canRetry }) => new Promise((resolve) => {
       const headers = copyRequestHeaders(req.headers, upstream, config);
       if (bodyBuffer) headers['content-length'] = String(bodyBuffer.length);
       else if (!hasBody) delete headers['content-length'];
 
       const transport = target.protocol === 'https:' ? https : http;
-      upstreamReq = transport.request(target, { method: req.method, headers }, (upstreamRes) => {
+      let settled = false;
+      let timedOut = false;
+      const settle = (retry) => {
+        if (settled) return;
+        settled = true;
+        activeUpstreamReq = null;
+        resolve({ retry });
+      };
+
+      const upstreamReq = transport.request(target, { method: req.method, headers }, (upstreamRes) => {
+        if (settled) {
+          upstreamRes.destroy();
+          return;
+        }
+        if (canRetry && !clientAborted && retryableStatus(upstreamRes.statusCode || 502)) {
+          upstreamRes.resume();
+          upstreamRes.on('end', () => settle(true));
+          upstreamRes.on('error', () => settle(true));
+          upstreamRes.on('close', () => settle(true));
+          return;
+        }
+
         const responseType = String(upstreamRes.headers['content-type'] || '').toLowerCase();
+        const isSse = responseType.includes('text/event-stream');
+        const isJsonResponse = responseType.includes('json');
+        const isAudio = responseType.startsWith('audio/');
+        const isWav = isAudio && /wav|wave/.test(responseType);
+        const fallback = isFallbackModel(model) ? model : null;
         const capture = [];
         let captureBytes = 0;
         let bytesOut = 0;
         let streamedUsage = null;
+        let audioBytes = 0;
+        let audioHeader = null;
         let ssePending = '';
         const sseDecoder = new StringDecoder('utf8');
-        const captureLimit = 4 * 1024 * 1024;
-        const isSse = responseType.includes('text/event-stream');
-        const isJsonResponse = responseType.includes('json');
 
-        const inspectSseText = (text, flush = false) => {
+        const inspectSse = (text, flush = false) => {
           ssePending += text;
           const lines = ssePending.split(/\r?\n/);
           ssePending = flush ? '' : (lines.pop() || '');
@@ -310,60 +298,91 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
             if (!line.startsWith('data:')) continue;
             const raw = line.slice(5).trim();
             if (!raw || raw === '[DONE]') continue;
-            try { const obj = JSON.parse(raw); const usage = findUsage(obj); if (usage) streamedUsage = usage; } catch {}
+            try {
+              const value = findUsage(JSON.parse(raw));
+              if (value) streamedUsage = value;
+            } catch { /* not a JSON event */ }
           }
         };
 
-        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.statusMessage || undefined, { ...copyResponseHeaders(upstreamRes.headers, config.corsOrigin), ...quotaHeaders(quotaStrict) });
+        res.writeHead(upstreamRes.statusCode || 502, upstreamRes.statusMessage || undefined, {
+          ...copyResponseHeaders(upstreamRes.headers, config),
+          ...meteringHeaders(),
+          ...(fallback ? { 'x-model-fallback': fallback } : {})
+        });
 
         const tap = new Transform({
-          transform(chunk, _enc, cb) {
+          transform(chunk, _encoding, callback) {
             bytesOut += chunk.length;
-            if (isSse) inspectSseText(sseDecoder.write(chunk));
-            else if (isJsonResponse && captureBytes < captureLimit) {
-              const remain = captureLimit - captureBytes;
-              capture.push(chunk.length <= remain ? Buffer.from(chunk) : Buffer.from(chunk.subarray(0, remain)));
-              captureBytes += Math.min(chunk.length, remain);
+            if (isSse) inspectSse(sseDecoder.write(chunk));
+            else if (isJsonResponse && captureBytes < CAPTURE_LIMIT) {
+              const remaining = CAPTURE_LIMIT - captureBytes;
+              capture.push(chunk.length <= remaining ? Buffer.from(chunk) : Buffer.from(chunk.subarray(0, remaining)));
+              captureBytes += Math.min(chunk.length, remaining);
+            } else if (isAudio) {
+              audioBytes += chunk.length;
+              if (!audioHeader && isWav) audioHeader = Buffer.from(chunk.subarray(0, 64));
             }
-            cb(null, chunk);
+            callback(null, chunk);
           }
         });
 
         upstreamRes.on('end', () => {
-          if (isSse) inspectSseText(sseDecoder.end(), true);
-          const usage = isSse ? streamedUsage : (isJsonResponse ? parseUsageFromBuffer(Buffer.concat(capture), responseType) : null);
-          finishOnce({ status: upstreamRes.statusCode || 0, bytesOut, usage, model: parsedModel || upstream.model });
+          if (isSse) inspectSse(sseDecoder.end(), true);
+          let usagePayload = isSse
+            ? streamedUsage
+            : (isJsonResponse ? parseUsageFromBuffer(Buffer.concat(capture), responseType) : null);
+          if (!usagePayload && isAudio && audioBytes > 0) {
+            const audioMs = estimateAudioMs({ contentType: responseType, bytes: audioBytes, header: audioHeader });
+            if (audioMs > 0) usagePayload = { audio_seconds: audioMs / 1000 };
+          }
+          finishOnce({ status: upstreamRes.statusCode || 0, bytesOut, usage: usagePayload, model, fallback });
+          settle(false);
         });
-        upstreamRes.on('error', (error) => finishOnce({ status: upstreamRes.statusCode || 0, bytesOut, error: error.message, model: parsedModel || upstream.model }));
+        upstreamRes.on('error', (error) => {
+          finishOnce({ status: upstreamRes.statusCode || 0, bytesOut, error: error.message, model });
+          settle(false);
+        });
         tap.on('error', (error) => {
           if (!res.destroyed) res.destroy(error);
         });
         upstreamRes.pipe(tap).pipe(res);
       });
 
-      if (config.upstreamTimeoutMs > 0) {
-        upstreamReq.setTimeout(config.upstreamTimeoutMs, () => upstreamReq.destroy(new Error(`Upstream timeout after ${config.upstreamTimeoutMs} ms`)));
+      activeUpstreamReq = upstreamReq;
+      if (config.server.upstreamTimeoutMs > 0) {
+        upstreamReq.setTimeout(config.server.upstreamTimeoutMs, () => {
+          timedOut = true;
+          upstreamReq.destroy(new Error(`Upstream timeout after ${config.server.upstreamTimeoutMs} ms`));
+        });
       }
 
       upstreamReq.on('error', (error) => {
-        const status = error.statusCode || (error.code === 'ETIMEDOUT' ? 504 : 502);
-        if (!res.headersSent) jsonError(res, status, status === 413 ? 'request_too_large' : 'upstream_error', error.message, config);
+        if (settled) return;
+        const status = error.statusCode || (timedOut || error.code === 'ETIMEDOUT' ? 504 : 502);
+        if (canRetry && !clientAborted && !res.headersSent && !error.statusCode) {
+          settle(true);
+          return;
+        }
+        if (!res.headersSent) jsonError(res, status, 'upstream_error', error.message, config, meteringHeaders());
         else if (!res.destroyed) res.destroy(error);
-        finishOnce({ status, bytesOut: 0, error: error.message, model: parsedModel || upstream.model });
+        finishOnce({ status, bytesOut: 0, error: error.message, model });
+        settle(false);
       });
-
-      req.on('aborted', () => upstreamReq.destroy(new Error('Client aborted request')));
 
       if (bodyBuffer) {
         upstreamReq.end(bodyBuffer);
       } else if (hasBody) {
         let streamBytes = 0;
         const counter = new Transform({
-          transform(chunk, _enc, cb) {
+          transform(chunk, _encoding, callback) {
             streamBytes += chunk.length;
             bytesIn = streamBytes;
-            if (streamBytes > config.maxStreamBodyBytes) return cb(Object.assign(new Error('Streaming request body too large'), { statusCode: 413 }));
-            cb(null, chunk);
+            if (streamBytes > config.server.maxStreamBodyBytes) {
+              callback(Object.assign(new Error('Streaming request body too large'), { statusCode: 413 }));
+              return;
+            }
+            callback(null, chunk);
           }
         });
         counter.on('error', (error) => upstreamReq.destroy(error));
@@ -371,72 +390,176 @@ export function createProxyServer(config, stats = new StatsStore({ file: config.
       } else {
         upstreamReq.end();
       }
+    });
+
+    const onClientGone = () => {
+      if (finished) return;
+      clientAborted = true;
+      activeUpstreamReq?.destroy(new Error('Client aborted request'));
+    };
+    req.on('aborted', onClientGone);
+    res.on('close', onClientGone);
+
+    try {
+      if (isJson) {
+        const read = await readBody(req, config.server.maxJsonBodyBytes);
+        bytesIn = read.size;
+        if (read.buffer.length) {
+          try { jsonValue = JSON.parse(read.buffer.toString('utf8')); }
+          catch { throw Object.assign(new Error('Invalid JSON request body'), { statusCode: 400 }); }
+          patchJsonBody(jsonValue, {
+            kind,
+            upstream,
+            modelPolicy: config.upstreams.modelPolicy,
+            voicePolicy: config.upstreams.voicePolicy
+          });
+          parsedModel = jsonValue?.model || null;
+          bodyBuffer = Buffer.from(JSON.stringify(jsonValue));
+        } else {
+          bodyBuffer = Buffer.alloc(0);
+        }
+      }
+
+      const configuredModel = String(upstream.model || '').toLowerCase();
+      const usesConfiguredModel = Boolean(parsedModel && configuredModel && String(parsedModel).toLowerCase() === configuredModel);
+      const fallbacks = isJson && usesConfiguredModel ? (upstream.modelFallbacks || []) : [];
+
+      if (identity && !finished && !clientAborted) {
+        const check = keys.checkRequest(identity.key, { model: parsedModel });
+        if (!check.ok) {
+          deny(check);
+        } else {
+          keys.touchKey(identity.key.id);
+        }
+      }
+
+      for (let attempt = 0; !finished && !clientAborted && attempt <= fallbacks.length; attempt += 1) {
+        const model = attempt === 0 ? parsedModel : fallbacks[attempt - 1];
+        servedModel = model || parsedModel || upstream.model;
+
+        if (attempt > 0 && jsonValue) {
+          jsonValue.model = model;
+          bodyBuffer = Buffer.from(JSON.stringify(jsonValue));
+        }
+        const { retry } = await runAttempt({ model, canRetry: attempt < fallbacks.length });
+        if (!retry) break;
+      }
+
+      if (!finished) {
+        finishOnce({ status: 502, bytesOut: 0, error: 'Client aborted request', model: servedModel });
+      }
     } catch (error) {
       const status = error.statusCode || 500;
-      if (!res.headersSent) jsonError(res, status, status === 413 ? 'request_too_large' : 'proxy_error', error.message, config);
-      upstreamReq?.destroy();
-      finishOnce({ status, bytesOut: 0, error: error.message, model: parsedModel || upstream.model });
+      if (!res.headersSent) jsonError(res, status, status === 413 ? 'request_too_large' : 'proxy_error', error.message, config, meteringHeaders());
+      activeUpstreamReq?.destroy();
+      finishOnce({ status, bytesOut: 0, error: error.message, model: servedModel });
     }
+  };
+
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch((error) => {
+      if (!res.headersSent) jsonError(res, 500, 'internal_error', 'Internal server error', config);
+      else res.destroy();
+    });
   });
 
   server.on('upgrade', (req, socket, head) => {
-    if (!authorized(req, config)) {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim()
+      || String(req.headers['x-api-key'] || '').trim();
+    let identity = token ? keys.authenticate(token) : null;
+    if (token && !identity) {
+      if (!config.keys.requireKey && config.keys.acceptAnyToken) identity = null;
+      else {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+    if (!token && config.keys.requireKey) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
-    const localUrl = new URL(req.url, 'http://localhost');
-    const kind = classifyRoute(localUrl.pathname);
-    const upstream = routeConfig(config, kind);
+    if (identity) {
+      const check = keys.checkRequest(identity.key, { ignoreModel: true });
+      if (!check.ok) {
+        socket.write(`HTTP/1.1 ${check.status || 429} ${check.code}\r\nConnection: close\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+    }
+
+    const url = new URL(req.url, 'http://localhost');
+    const kind = classifyRoute(url.pathname);
+    const upstream = upstreamFor(config, kind);
     if (!upstream?.baseUrl || !upstream?.apiKey) {
       socket.write('HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
     const target = buildUpstreamUrl(upstream.baseUrl, req.url);
-    const headers = { ...req.headers, ...copyRequestHeaders(req.headers, upstream, config) };
+    const headers = copyRequestHeaders(req.headers, upstream, config);
     headers.connection = 'Upgrade';
     headers.upgrade = req.headers.upgrade || 'websocket';
-    delete headers.host;
     delete headers['content-length'];
 
-    const requestMeta = stats.begin({ method: 'WS', path: localUrl.pathname + localUrl.search, kind, clientIp: String(req.socket.remoteAddress || '').replace(/^::ffff:/, '') });
-    let bytesIn = 0, bytesOut = 0, done = false;
+    const requestMeta = usage.begin({
+      method: 'WS',
+      path: url.pathname + url.search,
+      kind,
+      clientIp: remoteIp(req, config)
+    });
+    const keyInfo = identity ? { key: identity.key, account: identity.account } : null;
+    let bytesIn = 0;
+    let bytesOut = 0;
+    let done = false;
     const finish = (status, error = null) => {
       if (done) return;
       done = true;
-      const log = stats.finish(requestMeta, { status, bytesIn, bytesOut, error, model: upstream.model });
-      logLine(config, log);
+      logLine(config, usage.finish(requestMeta, { status, bytesIn, bytesOut, error, model: upstream.model, keyInfo }));
     };
 
     const transport = target.protocol === 'https:' ? https : http;
-    const up = transport.request(target, { method: req.method || 'GET', headers });
-    up.on('upgrade', (upRes, upSocket, upHead) => {
-      const raw = [`HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage || 'Switching Protocols'}`];
-      for (let i = 0; i < upRes.rawHeaders.length; i += 2) raw.push(`${upRes.rawHeaders[i]}: ${upRes.rawHeaders[i + 1]}`);
+    const upstreamReq = transport.request(target, { method: req.method || 'GET', headers });
+    upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+      const raw = [`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage || 'Switching Protocols'}`];
+      for (let i = 0; i < upstreamRes.rawHeaders.length; i += 2) raw.push(`${upstreamRes.rawHeaders[i]}: ${upstreamRes.rawHeaders[i + 1]}`);
       raw.push('', '');
       socket.write(raw.join('\r\n'));
-      if (head?.length) upSocket.write(head);
-      if (upHead?.length) socket.write(upHead);
-      socket.on('data', chunk => { bytesIn += chunk.length; });
-      upSocket.on('data', chunk => { bytesOut += chunk.length; });
-      socket.pipe(upSocket).pipe(socket);
+      if (head?.length) upstreamSocket.write(head);
+      if (upstreamHead?.length) socket.write(upstreamHead);
+      socket.on('data', (chunk) => { bytesIn += chunk.length; });
+      upstreamSocket.on('data', (chunk) => { bytesOut += chunk.length; });
+      socket.pipe(upstreamSocket).pipe(socket);
       socket.on('close', () => finish(101));
-      upSocket.on('error', error => finish(101, error.message));
+      upstreamSocket.on('error', (error) => finish(101, error.message));
     });
-    up.on('response', (upRes) => {
-      socket.write(`HTTP/1.1 ${upRes.statusCode || 502} ${upRes.statusMessage || 'Upstream Error'}\r\nConnection: close\r\n\r\n`);
-      upRes.pipe(socket);
-      upRes.on('end', () => finish(upRes.statusCode || 502));
+    upstreamReq.on('response', (upstreamRes) => {
+      socket.write(`HTTP/1.1 ${upstreamRes.statusCode || 502} ${upstreamRes.statusMessage || 'Upstream Error'}\r\nConnection: close\r\n\r\n`);
+      upstreamRes.pipe(socket);
+      upstreamRes.on('end', () => finish(upstreamRes.statusCode || 502));
     });
-    up.on('error', error => {
+    upstreamReq.on('error', (error) => {
       socket.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
       socket.destroy();
       finish(0, error.message);
     });
-    up.end();
+    upstreamReq.end();
   });
 
-  server.stats = stats;
+  server.usage = usage;
   return server;
+}
+
+async function readBody(req, maxBytes) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) {
+      throw Object.assign(new Error(`Request body exceeds ${Math.round(maxBytes / 1024 / 1024)} MB`), { statusCode: 413 });
+    }
+    chunks.push(chunk);
+  }
+  return { buffer: Buffer.concat(chunks), size };
 }

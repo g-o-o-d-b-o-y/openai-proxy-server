@@ -1,7 +1,7 @@
 {
   "name": "openai-proxy-server",
-  "version": "0.2.1",
-  "description": "A tiny OpenAI-compatible reverse proxy for LLM, TTS and STT with streaming, usage stats and a live dashboard.",
+  "version": "0.5.0",
+  "description": "OpenAI-compatible LLM/TTS/STT proxy with self-service API keys, reseller billing, subscriptions, per-key limits and live dashboards on SQLite.",
   "type": "module",
   "author": "Good Boy",
   "repository": {
@@ -19,14 +19,13 @@
     "src",
     "README.md",
     "LICENSE",
-    "scr.png",
     ".env.example"
   ],
   "scripts": {
     "start": "node ./bin/openai-proxy-server.js",
     "dev": "node --watch ./bin/openai-proxy-server.js",
     "test": "node --test",
-    "check": "node --check ./bin/openai-proxy-server.js && node --check ./src/server.js && node --check ./src/dashboard.js",
+    "check": "node --check ./bin/openai-proxy-server.js && node --check ./src/server.js && node --check ./src/dashboard.js && node --check ./src/index.js && node --check ./src/accounts.js && node --check ./src/keys.js && node --check ./src/usage.js && node --check ./src/settings.js && node --check ./src/db.js && node --check ./src/billing.js && node --check ./src/money.js && node --check ./src/audio.js && node --check ./src/http.js && node --check ./src/api/admin.js && node --check ./src/api/customer.js && node --check ./src/ui/admin.js && node --check ./src/ui/key.js && node --check ./src/ui/landing.js && node --check ./src/ui/theme.js",
     "prepublishOnly": "npm test && npm run check"
   },
   "keywords": [
@@ -39,11 +38,16 @@
     "stt",
     "speech-to-text",
     "text-to-speech",
-    "sse"
+    "sse",
+    "api-keys",
+    "reseller",
+    "billing",
+    "subscriptions",
+    "sqlite"
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.13.0"
   },
   "publishConfig": {
     "access": "public"

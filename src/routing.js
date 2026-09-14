@@ -1,19 +1,23 @@
+// Route classification and request shaping.
+
 export function classifyRoute(pathname) {
-  const normalized = pathname.replace(/^\/v1(?=\/|$)/, '') || '/';
-  if (/^\/audio\/speech\/?$/.test(normalized)) return 'tts';
-  if (/^\/audio\/(transcriptions|translations)\/?$/.test(normalized)) return 'stt';
-  return 'openai';
+  const path = pathname.replace(/^\/v1(?=\/|$)/, '') || '/';
+  if (/^\/audio\/speech\/?$/.test(path)) return 'tts';
+  if (/^\/audio\/(transcriptions|translations)\/?$/.test(path)) return 'stt';
+  return 'llm';
+}
+
+export function upstreamFor(config, kind) {
+  if (kind === 'tts') return config.upstreams.tts;
+  if (kind === 'stt') return config.upstreams.stt;
+  return config.upstreams.llm;
 }
 
 export function buildUpstreamUrl(baseUrl, incomingUrl) {
   const local = new URL(incomingUrl, 'http://localhost');
   let pathname = local.pathname.replace(/^\/v1(?=\/|$)/, '');
   if (!pathname) pathname = '/';
-  return new URL(baseUrl.replace(/\/+$/, '') + pathname + local.search);
-}
-
-export function routeConfig(config, kind) {
-  return kind === 'tts' ? config.tts : kind === 'stt' ? config.stt : config.openai;
+  return new URL(`${baseUrl.replace(/\/+$/, '')}${pathname}${local.search}`);
 }
 
 function applyPolicy(object, key, configured, policy) {

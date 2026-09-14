@@ -29,6 +29,6 @@ ENV PORT=56787
 EXPOSE 56787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -q -O - http://127.0.0.1:56787/_proxy/ >/dev/null 2>&1 || exit 1
+  CMD wget -q -O - http://127.0.0.1:56787/v1 >/dev/null 2>&1 || exit 1
 
 CMD ["node", "bin/openai-proxy-server.js"]
